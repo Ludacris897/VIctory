@@ -109,6 +109,12 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         ..Default::default()
     }];
     let mut out = Vec::new();
+    // One GPU test at a time, with the VALU tests: in parallel on the
+    // hardware adapter and WARP the test process sometimes died of an
+    // access violation (7 of 24 runs of these four tests).
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -214,5 +220,33 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
             })
             .collect();
         assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    let shader = build(WATERFALL_INDEXED_WAVE32, false);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    for (label, red) in results {
+        // Even lanes hold entry 0's offset, odd lanes entry 1's.
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
+fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
+    use crate::resource::tests::cmpx_waterfall;
+    // Lanes below 16 hold the first descriptor, the others the second.
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+    for folded in [false, true] {
+        let shader = build(&cmpx_waterfall(false, folded), false);
+        let results = sampled(&shader);
+        assert!(!results.is_empty());
+        for (label, red) in results {
+            assert_eq!(red, want, "{label}, folded {folded}");
+        }
     }
 }
