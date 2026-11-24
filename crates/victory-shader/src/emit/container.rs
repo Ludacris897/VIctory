@@ -63,6 +63,47 @@ impl SigElement {
     }
 }
 
+/// The console packs elements of different interpolation modes into one
+/// row (a constant front face beside a linear coordinate, say); DXIL needs
+/// one mode per row. Each later mode of a row moves to a free row of its
+/// own, shared by that row's elements of the mode. Code addresses elements
+/// by id and stages link by semantic, so only the signatures change.
+/// Elements without a mode (0) are left where they are.
+pub(crate) fn separate_interpolation(elements: &mut [SigElement]) {
+    let mut next = elements
+        .iter()
+        .filter_map(|e| e.row)
+        .max()
+        .map_or(0, |r| r + 1);
+    // (row, the row's first mode)
+    let mut first: Vec<(u32, u8)> = Vec::new();
+    // ((old row, mode), new row)
+    let mut moved: Vec<((u32, u8), u32)> = Vec::new();
+    for e in elements.iter_mut() {
+        let (Some(row), mode) = (e.row, e.interp) else {
+            continue;
+        };
+        if mode == 0 {
+            continue;
+        }
+        match first.iter().find(|f| f.0 == row) {
+            None => first.push((row, mode)),
+            Some(&(_, m)) if m == mode => {}
+            Some(_) => {
+                let to = match moved.iter().find(|m| m.0 == (row, mode)) {
+                    Some(&(_, to)) => to,
+                    None => {
+                        moved.push(((row, mode), next));
+                        next += 1;
+                        next - 1
+                    }
+                };
+                e.row = Some(to);
+            }
+        }
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -431,5 +472,36 @@ mod tests {
         assert_eq!(mesh_output_bytes(&rows, &[], 256, 256), MESH_OUTPUT_LIMIT);
         let over = mesh_output_bytes(&rows, &primitive, 256, 1);
         assert_eq!(over, MESH_OUTPUT_LIMIT + 4 * 2 * 32);
+    }
+
+    fn element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 1,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn rows_of_mixed_interpolation_are_separated() {
+        let mut e = vec![
+            element("A", 0, 0, 2),
+            element("B", 0, 1, 1),
+            element("C", 1, 0, 2),
+            element("D", 0, 2, 1),
+            element("E", 0, 3, 2),
+            element("F", 1, 1, 0),
+        ];
+        separate_interpolation(&mut e);
+        let rows: Vec<u32> = e.iter().map(|e| e.row.unwrap()).collect();
+        // B and D (constant) share a new row; A and E stay; F has no mode.
+        assert_eq!(rows, [0, 2, 1, 2, 0, 1]);
     }
 }
