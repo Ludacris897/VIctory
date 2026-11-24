@@ -122,7 +122,7 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 /// The translation changes still on trial, each off unless named in
-/// `VICTORY_TRIALS` (comma-separated, or `all`): `console` (the
+/// `VICTORY_TRIALS` (comma-separated, `all`, or `none`; unset: `sbuf`): `console` (the
 /// console-flow fallback for lane masks read as data, see
 /// [`CONSOLE_FLOW_FALLBACK`]), `stride` (structured reads of unknown
 /// stride through the runtime stride table, upstream #704), `gather4l`
@@ -137,7 +137,9 @@ pub const TRIALS: [&str; 4] = ["console", "stride", "gather4l", "sbuf"];
 pub fn trials() -> &'static str {
     static ON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ON.get_or_init(|| {
-        let v = std::env::var("VICTORY_TRIALS").unwrap_or_default();
+        // Unset: `sbuf` alone (the last build that showed the world had it;
+        // without it vertex and mesh shaders the scene needs drop).
+        let v = std::env::var("VICTORY_TRIALS").unwrap_or_else(|_| "sbuf".to_owned());
         let mut on: Vec<&str> = TRIALS
             .into_iter()
             .filter(|t| v == "all" || v.split(',').any(|x| x.trim() == *t))
