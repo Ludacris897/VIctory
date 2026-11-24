@@ -424,6 +424,15 @@ fn cross_warp_candidate(wave: u32, threads: u32, lds: u32, console_lanes: bool, 
     wave == 64 && (33..=64).contains(&threads) && lds > 0 && !console_lanes && straight_line
 }
 
+/// Address layout for image_sample_b: a full-width float bias followed
+/// by coordinates, which can be packed in half-word pairs.
+/// Other image opcodes retain their existing lowering.
+fn biased_sample_address(k: usize, a16: bool) -> (usize, Option<u32>) {
+    if !a16 || k == 0 { return (k, None); }
+    let coord = k - 1;
+    (1 + coord / 2, Some(16 * (coord as u32 % 2)))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, small_wave32: bool, cross_warp_trial: bool) -> Self {
         let p = x.p;
@@ -5377,7 +5386,7 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
+        if *a16 && name.starts_with("image_sample_b") && name != "image_sample_b" {
             return Err("a biased image sample with 16-bit coordinates");
         }
         // A load or sample with no channel enabled returns the first.
@@ -5410,16 +5419,19 @@ impl<'a> Lower<'a> {
         }
         // With a16, two 16-bit components per VGPR, low half first.
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+            let (word, half) = if name == "image_sample_b" {
+                biased_sample_address(k, *a16)
+            } else if *a16 {
+                (k / 2, Some(16 * (k as u32 % 2)))
+            } else {
+                (k, None)
+            };
+            let r = *regs.get(word).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
-                return Ok(x);
-            }
+            let Some(half) = half else { return Ok(x); };
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let (sh, mask) = (l.s.m.i32(half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -6750,6 +6762,17 @@ mod tests {
             End, End,
         ];
         assert!(!convergent_lds_cfg(&early_return, &[false, true, false]));
+    }
+
+    #[test]
+    fn biased_sample_preserves_full_bias_and_packed_coordinates() {
+        use super::biased_sample_address as addr;
+        assert_eq!(addr(0, true), (0, None));
+        assert_eq!(addr(1, true), (1, Some(0)));
+        assert_eq!(addr(2, true), (1, Some(16)));
+        assert_eq!(addr(3, true), (2, Some(0)));
+        assert_eq!(addr(4, true), (2, Some(16)));
+        for k in 0..5 { assert_eq!(addr(k, false), (k, None)); }
     }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
