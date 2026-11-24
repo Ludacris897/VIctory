@@ -637,26 +637,6 @@ impl State {
                     return false;
                 }
             }
-            if let Some(param) = stage.stride_table {
-                let gpu = (self.heaps[0] != 0)
-                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                    .flatten()
-                    .and_then(|h| h.stride_table_gpu());
-                if let Some(gpu) = gpu {
-                    // SAFETY: an open list; the stride table buffer lives with the host heap.
-                    unsafe {
-                        if compute {
-                            l.SetComputeRootShaderResourceView(param, gpu);
-                        } else {
-                            l.SetGraphicsRootShaderResourceView(param, gpu);
-                        }
-                    }
-                } else {
-                    once!("a shader reads the runtime stride table without a host view heap");
-                    self.fail = "the stride table";
-                    return false;
-                }
-            }
         }
         true
     }
@@ -1422,10 +1402,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(
-                format!("indirect kind {kind} max {max} at {arguments:#x}"),
-                kind == DISPATCH,
-            )
+            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         // The arguments and the count are read as indirect arguments: put
         // back in that state if the draw or dispatch moved them (one buffer
@@ -1557,10 +1534,7 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!(
-                "{}x{} f{} flags {:#x}",
-                d.Width, d.Height, d.Format.0, d.Flags.0
-            )
+            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
     match view {
