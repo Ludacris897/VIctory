@@ -60,11 +60,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
+    // Reserve work without allowing the 32-bit counter to wrap. A failed
+    // reservation must not increment the budget, even under contention.
+    if (cost == 0) return;
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    budget.InterlockedAdd(0, 0, before);
+    [allow_uav_condition]
+    while (true) {
+        if (before >= BUDGET || cost > BUDGET - before) {
+            args.Store(at, 0);
+            return;
+        }
+        uint observed;
+        budget.InterlockedCompareExchange(0, before, before + cost, observed);
+        if (observed == before) return;
+        before = observed;
     }
 }
 "#;
@@ -139,6 +149,22 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
+/// Reject layouts that cannot be addressed by the clamp's uint byte offsets
+/// or exceed D3D12's one-dimensional dispatch limit.
+fn valid_layout(kind: u32, stride: u32, records: u32) -> bool {
+    let minimum = match kind {
+        0 => 16, // D3D12_DRAW_ARGUMENTS
+        1 => 20, // D3D12_DRAW_INDEXED_ARGUMENTS
+        2 | 10 => 12, // dispatch / mesh
+        _ => return false,
+    };
+    records != 0
+        && stride >= minimum
+        && stride.is_multiple_of(4)
+        && records.div_ceil(64) <= 65_535
+        && records.checked_mul(stride).is_some()
+}
+
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
 /// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
@@ -150,12 +176,12 @@ pub(crate) fn bound(
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
+    if !gpu.is_multiple_of(4) || !valid_layout(kind, stride, records) {
+        return false;
+    }
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
-    }
     let l = &list.list;
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
@@ -206,6 +232,21 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indirect_layout_validation() {
+        assert!(super::valid_layout(0, 16, 1));
+        assert!(super::valid_layout(1, 20, 1));
+        assert!(super::valid_layout(2, 12, 65_535 * 64));
+        assert!(super::valid_layout(10, 16, 128));
+        assert!(!super::valid_layout(0, 12, 1));
+        assert!(!super::valid_layout(1, 16, 1));
+        assert!(!super::valid_layout(2, 13, 1));
+        assert!(!super::valid_layout(2, 12, 0));
+        assert!(!super::valid_layout(2, 12, 65_535 * 64 + 1));
+        assert!(!super::valid_layout(2, 0xffff_fffc, 2));
+        assert!(!super::valid_layout(3, 16, 1));
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
