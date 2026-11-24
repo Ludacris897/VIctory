@@ -80,7 +80,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    fresh_tables: std::collections::HashMap<(usize, u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -231,6 +231,7 @@ impl State {
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
+        self.root_uav_slots.clear();
         self.released = true;
     }
 
@@ -501,6 +502,32 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let mark = self.dynamic.len();
+        if self.bind_inner(list, p, compute) {
+            return true;
+        }
+        // No draw or dispatch consumes the newly reserved tables on a
+        // rejected bind. Leave previously accepted recordings untouched.
+        for (heap, first, count) in self.detach_rejected_slots(mark) {
+            crate::descriptor::release_dynamic(heap, first, count);
+        }
+        false
+    }
+
+    fn detach_rejected_slots(&mut self, mark: usize) -> Vec<(usize, u32, u32)> {
+        let released = self.dynamic.split_off(mark);
+        if released.is_empty() {
+            return released;
+        }
+        let keys: std::collections::HashSet<(usize, u32)> =
+            released.iter().map(|&(heap, first, _)| (heap, first)).collect();
+        self.fresh_tables.retain(|&(heap, _, _), first| !keys.contains(&(heap, *first)));
+        self.root_srv_slots.retain(|&(heap, _), first| !keys.contains(&(heap, *first)));
+        self.root_uav_slots.retain(|&(heap, _), first| !keys.contains(&(heap, *first)));
+        released
+    }
+
+    fn bind_inner(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1051,7 +1078,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, h.finish())
+                (std::ptr::from_ref(heap) as usize, table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1070,7 +1097,7 @@ impl State {
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
                 self.table_failed = true;
-                continue;
+                return made;
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
@@ -1593,4 +1620,28 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_bind_detaches_only_new_reservations() {
+        let mut state = State::default();
+        // Heap identities here are opaque keys only; nothing dereferences them.
+        state.dynamic = vec![(1, 40, 2), (2, 40, 4), (1, 42, 1), (1, 43, 1)];
+        state.fresh_tables.insert((1, 100, 5), 40);
+        state.fresh_tables.insert((2, 100, 5), 40);
+        state.root_srv_slots.insert((1, 200), 42);
+        state.root_uav_slots.insert((1, 300), 43);
+        assert_eq!(state.detach_rejected_slots(1), vec![(2, 40, 4), (1, 42, 1), (1, 43, 1)]);
+        assert_eq!(state.dynamic, vec![(1, 40, 2)]);
+        assert_eq!(state.fresh_tables.get(&(1, 100, 5)), Some(&40));
+        assert!(!state.fresh_tables.contains_key(&(2, 100, 5)));
+        assert!(state.root_srv_slots.is_empty());
+        assert!(state.root_uav_slots.is_empty());
+        // These synthetic keys were never actually leased from a host heap.
+        state.dynamic.clear();
+    }
 }

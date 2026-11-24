@@ -254,8 +254,11 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from the cursor, then allow starts below it whose
+        // free run extends across it. Never wrap a table across heap end.
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let starts = (cursor..end).chain(0..cursor.saturating_add(n - 1).min(end));
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -272,8 +275,18 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            static FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let failures = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if failures.is_power_of_two() {
+                let (mut free, mut largest, mut run) = (0usize, 0usize, 0usize);
+                for &occupied in taken.iter() {
+                    run = if occupied { 0 } else { run + 1 };
+                    free += usize::from(!occupied);
+                    largest = largest.max(run);
+                }
+                tracing::warn!(failures, n, free, largest, capacity = self.dynamic,
+                    "no free dynamic descriptor slots: a table is not made");
+            }
             return None;
         };
         taken[first..first + n].fill(true);
@@ -1278,6 +1291,20 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn dynamic_slots_find_a_free_run_across_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else { return; };
+        let a = heap.dynamic(heap.dynamic - 4).unwrap();
+        let b = heap.dynamic(2).unwrap();
+        // Cursor is two slots from the end. Four free adjacent slots
+        // straddle it; a request of four fits without wrapping the heap.
+        heap.release(b, 2);
+        assert_eq!(heap.dynamic(4), Some(b));
+        assert_eq!(heap.dynamic(1), None);
+        heap.release(a, heap.dynamic - 4);
+        assert_eq!(heap.dynamic(1), Some(a));
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
