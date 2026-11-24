@@ -10,8 +10,9 @@ fn main() {
         let code = p.patched_code();
         for i in gfx10::decode(&code).unwrap() { println!("{}", i.text(p.wave64)); }
     }
-    match emit::translate_for(&bytes, emit::Target::ANY) {
-        Ok(h) => println!("translated: dxil {} bytes", h.dxil.len()),
+    let t = if std::env::var("NV").is_ok() { emit::Target { lanes_min: 32, lanes_max: 32 } } else { emit::Target::ANY };
+    match emit::translate_for(&bytes, t) {
+        Ok(h) => { println!("translated: dxil {} bytes\n{}", h.dxil.len(), emit::last_module_summary()); if let Ok(o) = std::env::var("OUT") { std::fs::write(o, &h.dxil).unwrap(); } }
         Err(e) => println!("translate error: {e}"),
     }
 }
