@@ -258,6 +258,48 @@ mod tests {
         assert!(!super::valid_layout(3, 16, 1));
     }
 
+    /// Execute only the clamp (never the clamped draw arguments). Check
+    /// that contention cannot exceed the budget, and that rejected records
+    /// retain the other fields of their layout.
+    #[test]
+    fn argument_clamp_executes_budget_on_gpu() {
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU; execution test skipped");
+            return;
+        };
+        let list = host.new_list().expect("clamp test list");
+        let (buffer, data) = host.shared_buffer(128).expect("clamp test buffer");
+        // Eight records costing 2^26 each; budget 2^27.
+        unsafe {
+            for i in 0..8 {
+                let record = data.cast::<u32>().add(i * 4);
+                record.write(1 << 24);
+                record.add(1).write(4);
+                record.add(2).write(17);
+                record.add(3).write(23);
+            }
+        }
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        assert!(super::bound(&list, &buffer, gpu, (0, 16, 8)));
+        super::done(&list, &buffer);
+        list.close();
+        host.execute(&[&list]);
+        let mut accepted = 0;
+        unsafe {
+            for i in 0..8 {
+                let record = data.cast::<u32>().add(i * 4);
+                let count = record.read_volatile();
+                assert!(count == 0 || count == 1 << 24, "unexpected count {count}");
+                accepted += usize::from(count != 0);
+                assert_eq!(record.add(1).read_volatile(), 4);
+                assert_eq!(record.add(2).read_volatile(), 17);
+                assert_eq!(record.add(3).read_volatile(), 23);
+            }
+        }
+        assert_eq!(accepted, 2, "GPU budget must admit exactly two records");
+        eprintln!("GPU clamp executed: {accepted}/8 records accepted within budget");
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
