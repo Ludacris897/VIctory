@@ -353,8 +353,73 @@ fn required_wave(wave: u32, threads: u32, lds: u32, console_lanes: bool, small_w
     None
 }
 
-/// A single console wave becomes two host warps. Only straight-line
-/// compute code with no detected lane dependencies can use this trial.
+/// Check that the reachable CFG is acyclic and every marked block is
+/// unavoidable on every path to a return. These are the only blocks
+/// where the experiment may introduce a group synchronization point.
+fn convergent_lds_cfg(exits: &[LaneExit], required: &[bool]) -> bool {
+    let n = exits.len();
+    if n == 0 || n != required.len() || !required.iter().any(|&r| r) {
+        return false;
+    }
+    let mut successors = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (b, exit) in exits.iter().enumerate() {
+        let next = match *exit {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End => vec![],
+            _ => return false,
+        };
+        for &t in &next {
+            if t >= n {
+                return false;
+            }
+            indegree[t] += 1;
+        }
+        successors[b] = next;
+    }
+    // Require one entry and no unreachable blocks or cycles.
+    if indegree[0] != 0 || indegree[1..].contains(&0) {
+        return false;
+    }
+    let mut ready = vec![0];
+    let mut visited = 0;
+    while let Some(b) = ready.pop() {
+        visited += 1;
+        for &t in &successors[b] {
+            indegree[t] -= 1;
+            if indegree[t] == 0 {
+                ready.push(t);
+            }
+        }
+    }
+    if visited != n {
+        return false;
+    }
+    // A barrier block is mandatory iff no return can be reached with
+    // that block removed. Acyclicity also fixes barrier ordering.
+    for (barrier, &needed) in required.iter().enumerate() {
+        if !needed || barrier == 0 {
+            continue;
+        }
+        let mut seen = vec![false; n];
+        let mut todo = vec![0];
+        while let Some(b) = todo.pop() {
+            if b == barrier || seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            if matches!(exits[b], LaneExit::End) {
+                return false;
+            }
+            todo.extend(successors[b].iter().copied());
+        }
+    }
+    true
+}
+
+/// A single console wave becomes two host warps. Only convergent,
+/// acyclic compute code with no detected lane dependencies is eligible.
 fn cross_warp_candidate(wave: u32, threads: u32, lds: u32, console_lanes: bool, straight_line: bool) -> bool {
     wave == 64 && (33..=64).contains(&threads) && lds > 0 && !console_lanes && straight_line
 }
@@ -419,15 +484,18 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let threads = cs.threads.iter().product::<u32>();
             s.wave_size = required_wave(wave, threads, s.lds_dwords, console_lanes, small_wave32);
-            // Do not introduce group barriers into divergent branches,
-            // loops, whole-wave sections, or wave-dependent scalar reads.
-            let straight_line = p.blocks.len() == 1
-                && matches!(x.st.exits.first(), Some(LaneExit::End))
-                && x.st.guards.iter().flatten().all(|g| g.is_none())
-                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
-                && insts().any(|i| matches!(i.fields, Fields::Ds { .. }));
-            cross_warp_lds = cross_warp_trial
-                && cross_warp_candidate(wave, threads, s.lds_dwords, console_lanes, straight_line);
+            if cross_warp_trial && cross_warp_candidate(wave, threads, s.lds_dwords, console_lanes, true) {
+                let required: Vec<bool> = p.blocks.iter().map(|b| {
+                    b.insts.iter().any(|i| matches!(i.fields, Fields::Ds { .. }) || i.name() == "s_barrier")
+                }).collect();
+                let explicit_guarded_barrier = p.blocks.iter().enumerate().any(|(b, block)| {
+                    block.insts.iter().enumerate().any(|(i, inst)| inst.name() == "s_barrier" && x.st.guards[b][i].is_some())
+                });
+                cross_warp_lds = !explicit_guarded_barrier
+                    && !insts().any(|i| i.name() == "v_readfirstlane_b32")
+                    && insts().any(|i| matches!(i.fields, Fields::Ds { .. }))
+                    && convergent_lds_cfg(&x.st.exits, &required);
+            }
             if cross_warp_lds {
                 s.wave_size = Some(32);
             }
@@ -2167,8 +2235,18 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let x = if self.cross_warp_lds && guard.is_some() {
+                        // In the experiment, inactive lanes must not issue
+                        // an LDS load. Rejoin before the group barrier.
+                        let at = self.begin_guarded(guard);
+                        let p = dword(self, off + 4 * k);
+                        let inside = self.s.m.load(self.cur, p);
+                        let outside = self.s.m.i32(0);
+                        self.end_guarded(at, &[(inside, outside)])[0]
+                    } else {
+                        let p = dword(self, off + 4 * k);
+                        self.s.m.load(self.cur, p)
+                    };
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -6649,6 +6727,29 @@ mod tests {
         assert!(!cross_warp_candidate(64, 64, 0, false, true));
         assert!(!cross_warp_candidate(64, 64, 16, true, true));
         assert!(!cross_warp_candidate(64, 64, 16, false, false));
+    }
+
+    #[test]
+    fn convergent_lds_cfg_rejects_optional_barriers_and_cycles() {
+        use super::{convergent_lds_cfg, LaneExit, Bool};
+        use LaneExit::{Jump, End};
+        let diamond = [
+            LaneExit::Branch { when: Bool::TRUE, taken: 1, not_taken: 2 },
+            Jump(3), Jump(3), End,
+        ];
+        assert!(convergent_lds_cfg(&diamond, &[true, false, false, true]));
+        assert!(!convergent_lds_cfg(&diamond, &[false, true, false, true]));
+        assert!(!convergent_lds_cfg(&diamond, &[false, false, true, false]));
+        assert!(convergent_lds_cfg(&[Jump(1), Jump(2), End], &[false, true, true]));
+        assert!(!convergent_lds_cfg(&[Jump(1), Jump(1)], &[true, true]));
+        assert!(!convergent_lds_cfg(&[End, End], &[true, false]));
+        assert!(!convergent_lds_cfg(&[Jump(7)], &[true]));
+        assert!(!convergent_lds_cfg(&[End], &[false]));
+        let early_return = [
+            LaneExit::Branch { when: Bool::TRUE, taken: 1, not_taken: 2 },
+            End, End,
+        ];
+        assert!(!convergent_lds_cfg(&early_return, &[false, true, false]));
     }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
