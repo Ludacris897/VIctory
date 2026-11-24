@@ -4005,6 +4005,10 @@ impl<'a> Lower<'a> {
                     }
                     (props, None)
                 }
+                // A buffer the program also reads through s_buffer_load (a
+                // constant buffer it measures or indexes by hand): a raw
+                // buffer view describes it.
+                Fields::Smem { .. } if un.starts_with("s_buffer_load") => ((11, 0), None),
                 _ => return Err("a scalar memory read as data"),
             };
             (first, src, props, image, uav)
