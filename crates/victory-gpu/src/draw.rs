@@ -82,6 +82,8 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Diagnostics: why the last prepare or bind refused its draw.
+    fail: &'static str,
     /// The list's dynamic slots were given back after it ran (see
     /// [`State::executed`]); set until the list is reset.
     released: bool,
@@ -380,13 +382,16 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            self.fail = "skipped (VICTORY_SKIP_PIPELINES)";
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            self.fail = "no host pipeline";
             return false;
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            self.fail = "another kind of pipeline";
             return false;
         }
         if !self.bind(list, p, false) {
@@ -423,6 +428,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                self.fail = "index buffer with no host copy";
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -506,6 +512,7 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
+                self.fail = "no dynamic slots for its tables";
                 return false;
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -527,6 +534,7 @@ impl State {
                                 slot = u.slot,
                                 "a draw or dispatch dropped: its table lies past the host heap"
                             );
+                            self.fail = "a table past the host heap";
                             return false;
                         }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -549,12 +557,14 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
                         if tabled && !self.root_srv_table(list, None, param, compute) {
+                            self.fail = "root SRV table (null)";
                             return false;
                         }
                         continue;
                     };
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute) {
+                            self.fail = "root SRV table";
                             return false;
                         }
                         continue;
@@ -1148,8 +1158,13 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        self.fail = "unknown";
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED if self.topology == RECTANGLES => {
+                self.fail = "rectangle list topology";
+                false
+            }
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1162,7 +1177,10 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {}): {}",
+                    p.compute, p.mesh, self.fail
+                )),
             }
             return false;
         }
