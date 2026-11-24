@@ -136,6 +136,10 @@ fn make() -> windows::core::Result<Clamp> {
 
 fn make_variant(isolated: bool) -> windows::core::Result<Clamp> {
     let source = if isolated { format!("#define ISOLATED 1\n{SOURCE}") } else { SOURCE.to_owned() };
+    compile_compute(&source)
+}
+
+fn compile_compute(source: &str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -421,6 +425,75 @@ mod tests {
         }
         assert_eq!(accepted, 2);
         eprintln!("isolated GPU clamp: 2/8 accepted; source unchanged; count clamped to 8");
+    }
+
+    /// Full round trip: GPU-produced private arguments and count are
+    /// consumed by a real ExecuteIndirect. The dispatched shader merely
+    /// increments a mapped word once per group.
+    #[test]
+    fn isolated_execute_indirect_consumes_gpu_count() {
+        use super::*;
+        let Some(host) = host() else {
+            eprintln!("no host GPU; indirect execution test skipped");
+            return;
+        };
+        let shader = compile_compute(r#"
+RWByteAddressBuffer output_word : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1,1,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint old;
+    output_word.InterlockedAdd(0, 1, old);
+}
+"#).expect("test compute shader");
+        let list = host.new_list().expect("indirect execution test list");
+        let (source, data) = host.shared_buffer(52).expect("indirect source");
+        let (output, out) = host.shared_buffer(256).expect("indirect result");
+        unsafe {
+            for (i, groups) in [2u32, 3, 4].into_iter().enumerate() {
+                let record = data.cast::<u32>().add(i * 4);
+                record.write(groups);
+                record.add(1).write(1);
+                record.add(2).write(1);
+                record.add(3).write(0xfeedbeef);
+            }
+            data.cast::<u32>().add(12).write(2);
+            out.cast::<u32>().write(0);
+        }
+        let gpu = unsafe { source.GetGPUVirtualAddress() };
+        let args = bound_isolated(&list, gpu, Some(gpu + 48), (2, 16, 3))
+            .expect("private dispatch arguments");
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: args.stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        unsafe {
+            host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+                .expect("dispatch command signature");
+            list.list.SetComputeRootSignature(&shader.root);
+            list.list.SetPipelineState(&shader.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, output.GetGPUVirtualAddress());
+            let signature = signature.expect("signature");
+            list.keep(&signature);
+            list.list.ExecuteIndirect(&signature, 3, &args.buffer, 0,
+                Some(&args.buffer), args.count_offset);
+            list.list.ResourceBarrier(&[uav_barrier()]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        unsafe {
+            assert_eq!(out.cast::<u32>().read_volatile(), 5);
+            assert_eq!(data.cast::<u32>().add(12).read_volatile(), 2);
+            assert_eq!(data.cast::<u32>().add(8).read_volatile(), 4);
+        }
+        eprintln!("isolated ExecuteIndirect: 5 groups executed from 2 counted commands");
     }
 
     /// Execute only the clamp (never the clamped draw arguments). Check
