@@ -218,7 +218,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    emit_with_wave_policy(c, native, p, st, io, res, false).map(|(shader, _)| shader)
+    emit_with_wave_policy(c, native, p, st, io, res, false).map(|(shader, _, _)| shader)
 }
 
 /// Offline wave-size experiment. The ordinary runtime emitter retains its
@@ -231,7 +231,7 @@ pub fn emit_with_wave_policy(
     io: &io::Io,
     res: &resource::Resources,
     small_wave32: bool,
-) -> Result<(HostShader, Option<u32>), ShaderError> {
+) -> Result<(HostShader, Option<u32>, bool), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -297,6 +297,7 @@ pub fn emit_with_wave_policy(
         lower::lower(&parts)?
     };
     let requested = l.requested_wave_size;
+    let console_lanes = l.console_lanes;
     Ok((HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -316,7 +317,7 @@ pub fn emit_with_wave_policy(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
-    }, requested))
+    }, requested, console_lanes))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
