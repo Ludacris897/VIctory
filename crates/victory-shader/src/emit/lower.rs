@@ -8652,7 +8652,9 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
-                let ballot_ok = self.mask_data == MaskData::Host
+                // (Console flow: the console wave's ballot, every lane running
+                // the mask's block.)
+                let ballot_ok = (self.mask_data == MaskData::Host || self.console_cf)
                     && !bit
                     && self.read_phis.contains(&phi.value)
                     && self.x.st.masks.contains_key(&lo)

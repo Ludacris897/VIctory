@@ -450,6 +450,14 @@ pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
 fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
+        // Back-edge arguments of console joins: their masks too (reading
+        // one can make another join an atom).
+        let mut j = 0;
+        while j < l.phi_args.len() {
+            let a = l.phi_args[j];
+            l.mask(a);
+            j += 1;
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -495,6 +503,9 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Console flow: the arguments of joins left as atoms, all of whose
+    /// masks lowering reads (back edges included).
+    phi_args: Vec<Key>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -559,10 +570,12 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            phi_args: Vec::new(),
         })
     }
 
     fn reset(&mut self) {
+        self.phi_args.clear();
         self.b = Bools::new();
         self.masks.clear();
         self.other.clear();
@@ -915,6 +928,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.phi_args.extend(args.iter().copied());
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))

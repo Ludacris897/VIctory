@@ -272,6 +272,22 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_for(container, Target::ANY)
 }
 
+/// Refusals of the per-lane form that the console flow may lower.
+const CONSOLE_FLOW_FALLBACK: [&str; 4] = [
+    "a lane mask holding lanes elsewhere read as data",
+    "a lane mask read as data",
+    "a select on an untracked mask",
+    "a lane-mask join of an untracked mask",
+];
+
+/// A compute program whose group is one console wave.
+fn one_console_wave(native: &NativeProgram) -> bool {
+    match native.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>() <= if native.wave64 { 64 } else { 32 },
+        _ => false,
+    }
+}
+
 /// [`translate`] for a host that runs the wave sizes of `target`.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
@@ -407,6 +423,26 @@ pub fn emit(
                     parts.per_lane_only = true;
                     lower::lower(&parts).map_err(|_| e)?
                 }
+            }
+        }
+        // Lane masks the per-lane form cannot follow (read as numbers with
+        // lanes inactive, or selected on untracked): the console flow holds
+        // every lane's bit, for a compute group of one console wave.
+        Err(ShaderError::Unsupported { what, .. })
+            if CONSOLE_FLOW_FALLBACK.contains(&what)
+                && one_console_wave(native)
+                && target.runs(if native.wave64 { 64 } else { 32 }) =>
+        {
+            let e = ShaderError::Unsupported { offset: 0, what };
+            match structure::structure_console(p) {
+                Ok(console) => {
+                    parts.st = &console;
+                    parts.console_cf = true;
+                    let l = lower::lower(&parts).map_err(|_| e);
+                    parts.st = st;
+                    l?
+                }
+                Err(_) => return Err(e),
             }
         }
         l => l?,
