@@ -81,14 +81,16 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(usize, u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
+    /// The dynamic slots the list holds: native heap identity, first, count.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Hold the actual heap, allocator and descriptor resource references
+    /// until this recording is reset or destroyed.
+    held_heaps: std::collections::HashMap<usize, std::sync::Arc<crate::descriptor::host::HostHeap>>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
-    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
     /// Diagnostics: why the last prepare or bind refused its draw.
     fail: &'static str,
     /// The list's dynamic slots were given back after it ran (see
@@ -96,13 +98,15 @@ pub(crate) struct State {
     released: bool,
     /// Root UAVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
-    root_uav_slots: std::collections::HashMap<(usize, u64), u32>,
+    root_uav_slots: std::collections::HashMap<(usize, u64, usize), u32>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+            if let Some(owner) = self.held_heaps.get(&heap) {
+                owner.release(first, n);
+            }
         }
     }
 }
@@ -229,7 +233,9 @@ impl State {
             return;
         }
         for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+            if let Some(owner) = self.held_heaps.get(&heap) {
+                owner.release(first, n);
+            }
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
@@ -511,7 +517,9 @@ impl State {
         // No draw or dispatch consumes the newly reserved tables on a
         // rejected bind. Leave previously accepted recordings untouched.
         for (heap, first, count) in self.detach_rejected_slots(mark) {
-            crate::descriptor::release_dynamic(heap, first, count);
+            if let Some(owner) = self.held_heaps.get(&heap) {
+                owner.release(first, count);
+            }
         }
         false
     }
@@ -524,8 +532,8 @@ impl State {
         let keys: std::collections::HashSet<(usize, u32)> =
             released.iter().map(|&(heap, first, _)| (heap, first)).collect();
         self.fresh_tables.retain(|&(heap, _, _), first| !keys.contains(&(heap, *first)));
-        self.root_srv_slots.retain(|&(heap, _), first| !keys.contains(&(heap, *first)));
-        self.root_uav_slots.retain(|&(heap, _), first| !keys.contains(&(heap, *first)));
+        self.root_srv_slots.retain(|&(heap, _, _), first| !keys.contains(&(heap, *first)));
+        self.root_uav_slots.retain(|&(heap, _, _), first| !keys.contains(&(heap, *first)));
         released
     }
 
@@ -533,18 +541,21 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
+        let resolved = self.heaps.map(|h| {
+            (h != 0).then(|| crate::descriptor::heap(h as This).host_shared()).flatten()
+        });
+        let identities = resolved.map(|h| h.map_or(0, |h| h.heap.as_raw() as usize));
+        if self.host_heaps != identities {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = resolved.iter()
+                .flatten().map(|h| Some(h.heap.clone())).collect();
+            for owner in resolved.into_iter().flatten() {
+                self.held_heaps.entry(owner.heap.as_raw() as usize)
+                    .or_insert_with(|| std::sync::Arc::clone(owner));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = identities;
             self.host_roots = [0; 2];
         }
         let root = p.root.as_raw() as usize;
@@ -684,18 +695,19 @@ impl State {
         param: u32,
         compute: bool,
     ) -> bool {
-        let Some((heap, host)) = self
+        let Some(host) = self
             .heaps
             .iter()
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
-            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()))
         else {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let key = (host.heap.as_raw() as usize, address.unwrap_or(0),
+            shadow.as_ref().map_or(0, |(_, s)| s.buffer.as_raw() as usize));
         let index = match self.root_uav_slots.get(&key) {
             Some(&index) => index,
             None => {
@@ -767,18 +779,19 @@ impl State {
         param: u32,
         compute: bool,
     ) -> bool {
-        let Some((heap, host)) = self
+        let Some(host) = self
             .heaps
             .iter()
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
-            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()))
         else {
             once!("a root SRV without a bound view heap: the draw is dropped");
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let key = (host.heap.as_raw() as usize, address.unwrap_or(0),
+            shadow.as_ref().map_or(0, |(_, s)| s.buffer.as_raw() as usize));
         let index = match self.root_srv_slots.get(&key) {
             Some(&index) => index,
             None => {
@@ -1080,12 +1093,13 @@ impl State {
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                n.hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (std::ptr::from_ref(heap) as usize, table, h.finish())
+                (host.heap.as_raw() as usize, table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1108,7 +1122,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((host.heap.as_raw() as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1647,14 +1661,37 @@ mod reservation_tests {
     use super::*;
 
     #[test]
+    fn reservation_keeps_native_heap_alive_and_releases_only_its_slots() {
+        use std::sync::Arc;
+        use crate::descriptor::host::HostHeap;
+        let Some(old) = HostHeap::new(false, 4).map(Arc::new) else { return; };
+        let Some(new) = HostHeap::new(false, 4) else { return; };
+        let a = old.dynamic(1).unwrap();
+        let b = new.dynamic(1).unwrap();
+        assert_eq!(a, b);
+        let identity = old.heap.as_raw() as usize;
+        let weak = Arc::downgrade(&old);
+        let mut state = State::default();
+        state.held_heaps.insert(identity, old);
+        state.dynamic.push((identity, a, 1));
+        let retained = weak.upgrade().expect("recording retains original heap");
+        drop(state);
+        assert_eq!(Arc::strong_count(&retained), 1);
+        // The replacement heap's first slot remains occupied.
+        assert_ne!(new.dynamic(1).unwrap(), b);
+        // Both heaps have the same numeric slot indices but distinct owners.
+        assert_ne!(retained.heap.as_raw(), new.heap.as_raw());
+    }
+
+    #[test]
     fn rejected_bind_detaches_only_new_reservations() {
         let mut state = State::default();
         // Heap identities here are opaque keys only; nothing dereferences them.
         state.dynamic = vec![(1, 40, 2), (2, 40, 4), (1, 42, 1), (1, 43, 1)];
         state.fresh_tables.insert((1, 100, 5), 40);
         state.fresh_tables.insert((2, 100, 5), 40);
-        state.root_srv_slots.insert((1, 200), 42);
-        state.root_uav_slots.insert((1, 300), 43);
+        state.root_srv_slots.insert((1, 200, 9), 42);
+        state.root_uav_slots.insert((1, 300, 10), 43);
         assert_eq!(state.detach_rejected_slots(1), vec![(2, 40, 4), (1, 42, 1), (1, 43, 1)]);
         assert_eq!(state.dynamic, vec![(1, 40, 2)]);
         assert_eq!(state.fresh_tables.get(&(1, 100, 5)), Some(&40));
