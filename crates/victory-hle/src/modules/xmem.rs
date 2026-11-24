@@ -397,6 +397,13 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `VICTORY_POOL_COMMIT=1`: physical pages are a committed section (see
+/// [`XMemAllocatePhysicalPages`]).
+fn pool_commit() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -423,7 +430,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            //
+            // `VICTORY_POOL_COMMIT=1` commits it whole on Windows too: only a
+            // committed section can be opened as one host heap, which lets
+            // the card read and write the pages in place (`VICTORY_INPLACE_POOL`).
+            PAGE_READWRITE | if on_wine() || pool_commit() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -443,7 +454,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || pool_commit());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
