@@ -64,6 +64,9 @@ struct Tally {
     cs_emitted: usize,
     cs_validated: usize,
     cs_pipelines: usize,
+    cs_native_wave_emitted: [usize; 2],
+    cs_native_wave_pipelines: [usize; 2],
+    stage_skipped: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -126,6 +129,11 @@ impl Tally {
         self.cs_emitted += other.cs_emitted;
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
+        self.stage_skipped += other.stage_skipped;
+        for i in 0..2 {
+            self.cs_native_wave_emitted[i] += other.cs_native_wave_emitted[i];
+            self.cs_native_wave_pipelines[i] += other.cs_native_wave_pipelines[i];
+        }
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -160,6 +168,7 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
+    let compute_only = std::env::var_os("VICTORY_TRANSLATE_COMPUTE_ONLY").is_some();
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -179,12 +188,13 @@ pub fn run(
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    anyhow::ensure!(!compute_only || pairs.is_empty(), "compute-only translation cannot build graphics pairs");
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines})");
+    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines}, compute_only={compute_only})");
     let mut scanned = 0usize;
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -227,7 +237,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only);
                             let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             if n % 256 == 0 || n == job_count {
                                 let seconds = file_started.elapsed().as_secs_f64();
@@ -246,6 +256,9 @@ pub fn run(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
     );
+    if compute_only {
+        println!("compute-only: {} non-compute native programs skipped", t.stage_skipped);
+    }
     println!(
         "programs     {} translated of {} ({} IR instructions)",
         t.translated, t.programs, t.instructions
@@ -290,6 +303,9 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    for (i, wave) in [32, 64].into_iter().enumerate() {
+        println!("compute native wave{wave}: {} emitted, {} pipelines", t.cs_native_wave_emitted[i], t.cs_native_wave_pipelines[i]);
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -327,6 +343,7 @@ fn translate(
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
+    compute_only: bool,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -348,6 +365,10 @@ fn translate(
         Err(e) => return t.fail(e.to_string(), example),
     };
     for p in programs {
+        if compute_only && p.stage != HwStage::Cs {
+            t.stage_skipped += 1;
+            continue;
+        }
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(program) => {
@@ -409,7 +430,13 @@ fn translate(
                     match emit::emit(&container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            let before = t.cs_pipelines;
                             check(shader, t, checks, label);
+                            if compute {
+                                let i = usize::from(p.wave64);
+                                t.cs_native_wave_emitted[i] += 1;
+                                t.cs_native_wave_pipelines[i] += t.cs_pipelines - before;
+                            }
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
