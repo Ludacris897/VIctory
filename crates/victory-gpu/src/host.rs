@@ -650,7 +650,11 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
+            #[cfg(feature = "diagnostics")]
+            let steps = std::time::Instant::now();
             list.run_deferred(&mut batch);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::StepsUs, steps.elapsed().as_micros() as u64);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -748,11 +752,15 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let bottom = std::time::Instant::now();
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BottomUs, bottom.elapsed().as_micros() as u64);
         self.log_messages();
     }
 
@@ -1500,13 +1508,19 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    #[cfg(feature = "diagnostics")]
+                    let snap = std::time::Instant::now();
                     shadow.writing(*address, *len);
+                    #[cfg(feature = "diagnostics")]
+                    add(C::GpuWriteUs, snap.elapsed().as_micros() as u64);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
+                    #[cfg(feature = "diagnostics")]
+                    add(C::TextureUs, started.elapsed().as_micros() as u64);
                     continue;
                 }
             };
@@ -1531,6 +1545,10 @@ impl HostList {
 struct Batch {
     /// Per copy, `[from, to)` ranges in the order they came.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)>,
+    /// Where each copy sits in `refreshes`, by `Arc::as_ptr` (upstream
+    /// #1556): a world submission records ten thousand refreshes over a few
+    /// hundred copies, and scanning for each was quadratic.
+    refresh_index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -1553,19 +1571,33 @@ fn coalesce_ranges(ranges: &mut Ranges, page: usize) {
     *ranges = merged;
 }
 
+/// Diagnostics: adds the time since its start to the flush counter when
+/// dropped.
+#[cfg(feature = "diagnostics")]
+struct Timed(std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        crate::copystat::add(crate::copystat::C::FlushUs, self.0.elapsed().as_micros() as u64);
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         if len == 0 {
             return;
         }
         let range = (address, address.saturating_add(len));
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, ranges)) => ranges.push(range),
-            None => self.refreshes.push((shadow.clone(), vec![range])),
+        // The entry holds a clone of the copy, so the address the key names
+        // is not reused while it is in the index.
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        match self.refresh_index.get(&key) {
+            Some(&at) => self.refreshes[at].1.push(range),
+            None => {
+                self.refresh_index.insert(key, self.refreshes.len());
+                self.refreshes.push((shadow.clone(), vec![range]));
+            }
         }
     }
 
@@ -1583,6 +1615,11 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let flushing = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let _timed = Timed(flushing);
+        self.refresh_index.clear();
         for (shadow, mut ranges) in self.refreshes.drain(..) {
             coalesce_ranges(&mut ranges, crate::watch::PAGE);
             for (from, to) in ranges {

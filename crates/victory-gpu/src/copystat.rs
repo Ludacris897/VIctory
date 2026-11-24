@@ -37,8 +37,16 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Where a submission's preparation goes (microseconds): flushing
+    /// refreshes, snapshots for shader writes, texture checks, recording
+    /// the steps; and of copy-back, the bottom-of-pipe writes.
+    FlushUs,
+    GpuWriteUs,
+    TextureUs,
+    StepsUs,
+    BottomUs,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 27;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +134,15 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "preparing per frame: steps {:.1} ms (flushing refreshes {:.1} ms, snapshots for shader \
+         writes {:.1} ms, textures {:.1} ms); bottom-of-pipe writes {:.2} ms",
+        ms(c[C::StepsUs as usize]),
+        ms(c[C::FlushUs as usize]),
+        ms(c[C::GpuWriteUs as usize]),
+        ms(c[C::TextureUs as usize]),
+        ms(c[C::BottomUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
