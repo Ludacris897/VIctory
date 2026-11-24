@@ -198,6 +198,17 @@ impl State {
     /// A list run again without a reset would read slots others may have
     /// made since: that is reported.
     pub(crate) fn executed(&mut self) {
+        // `VICTORY_SLOT_RELEASE=0`: keep them until the reset, as before.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| {
+            let off = std::env::var("VICTORY_SLOT_RELEASE").is_ok_and(|v| v.trim() == "0");
+            if off {
+                tracing::warn!("VICTORY_SLOT_RELEASE=0: dynamic slots kept until a list's reset");
+            }
+            off
+        }) {
+            return;
+        }
         if self.released {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {

@@ -241,6 +241,12 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// IR blocks whose `s_barrier` only some lanes of the group reach (it is
+    /// control-dependent on a per-lane branch, or other lanes can end the
+    /// program without it): on the console ended waves count as arrived, a
+    /// host thread-group sync there waits forever (NVIDIA: device removed).
+    /// Only the memory fences are emitted (upstream #587).
+    fence_only_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -751,6 +757,7 @@ impl<'a> Lower<'a> {
             console_flat: None,
             xchg: None,
             flat: None,
+            fence_only_barrier: divergent_barriers(p, x.st, &no_barrier),
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -3044,7 +3051,8 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                let sync = if self.fence_only_barrier.contains(&b) { 0 } else { 1 };
+                let mode = sync | 8 | if self.writes_uavs { 2 } else { 0 };
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -9604,4 +9612,74 @@ mod tests {
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
+}
+
+/// IR blocks with an `s_barrier` (not in `skip`) that only some lanes may
+/// reach: a per-lane branch leads to it on one side and, on the other, to
+/// the program's end without passing it (from upstream #587).
+fn divergent_barriers(
+    p: &crate::ir::Program,
+    st: &crate::structure::Structured,
+    skip: &HashSet<usize>,
+) -> HashSet<usize> {
+    let n = p.blocks.len();
+    let barriers: Vec<usize> = (0..n)
+        .filter(|b| !skip.contains(b) && p.blocks[*b].insts.iter().any(|i| i.name() == "s_barrier"))
+        .collect();
+    if barriers.is_empty() {
+        return HashSet::new();
+    }
+    let divergent: Vec<(usize, usize)> = (0..n)
+        .filter_map(|u| match st.exits[u] {
+            LaneExit::Branch { when, taken, not_taken }
+                if taken != not_taken
+                    && st.bools.support(when).iter().any(|a| !matches!(a, Atom::Uniform(_))) =>
+            {
+                Some((taken, not_taken))
+            }
+            _ => None,
+        })
+        .collect();
+    if divergent.is_empty() {
+        return HashSet::new();
+    }
+    let ends: Vec<usize> = (0..n).filter(|&b| matches!(st.exits[b], LaneExit::End)).collect();
+    let mut out = HashSet::new();
+    for b in barriers {
+        // Blocks from which `b` can be reached.
+        let mut can_reach = vec![false; n];
+        let mut stack = vec![b];
+        can_reach[b] = true;
+        while let Some(cur) = stack.pop() {
+            for &pred in &p.blocks[cur].preds {
+                if !can_reach[pred] {
+                    can_reach[pred] = true;
+                    stack.push(pred);
+                }
+            }
+        }
+        // Blocks from which an end can be reached without passing `b`.
+        let mut can_bypass = vec![false; n];
+        for &e in &ends {
+            if e != b && !can_bypass[e] {
+                can_bypass[e] = true;
+                stack.push(e);
+            }
+        }
+        while let Some(cur) = stack.pop() {
+            for &pred in &p.blocks[cur].preds {
+                if pred != b && !can_bypass[pred] {
+                    can_bypass[pred] = true;
+                    stack.push(pred);
+                }
+            }
+        }
+        if divergent
+            .iter()
+            .any(|&(t, f)| (can_reach[t] && can_bypass[f]) || (can_reach[f] && can_bypass[t]))
+        {
+            out.insert(b);
+        }
+    }
+    out
 }

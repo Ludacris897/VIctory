@@ -47,6 +47,18 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+#[cfg(feature = "diagnostics")]
+fn refresh_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_REFRESH_ALL").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::warn!("VICTORY_REFRESH_ALL=1: every host copy refreshed whole");
+        }
+        on
+    })
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -58,6 +70,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Diagnostics: `VICTORY_REFRESH_ALL=1` takes every page as just written
+    // (every host copy refreshed whole each time: slow, but never stale).
+    #[cfg(feature = "diagnostics")]
+    if refresh_all() {
+        j.asked += 1;
+        let now = j.asked;
+        for page in first..last {
+            j.written.insert(page, now);
+        }
+        return Some((now, (first..last).map(|p| (p, now)).collect()));
+    }
     // Guarded blocks all still clean: nothing was written there, and the
     // answer is the journal's. Asking the kernel would fail (views are not
     // write-watched) and `guard`'s query walks the view's pages; for a big
@@ -139,12 +162,17 @@ struct Guards {
     /// them page by page through the kernel's failing reads, hundreds of
     /// MB per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks found to be in a view when an asking began there, until the
+    /// runtime remaps them. Asking the system each time (`VirtualQuery`)
+    /// cost 100-230 ms per world frame, more than the rest of the guard.
+    views: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    views: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -155,19 +183,18 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.Type != MEM_MAPPED {
-        return None;
-    }
     install();
     let mut g = guards();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Asked under the lock: a remap in between would leave a stale view.
+    if !g.views.contains(&first) {
+        if !view(start) {
+            return None;
+        }
+        g.views.insert(first);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
         let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
         if open {
@@ -185,6 +212,52 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether the current allocation at `at` is a mapped view. Asking only for
+/// the allocation type avoids enumerating pages with identical protection,
+/// which can span an entire large view after its blocks were guarded.
+fn mapped(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_MAPPED, MEMORY_BASIC_INFORMATION, MemoryRegionInfo, QueryVirtualMemoryInformation,
+        VirtualQuery, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: both queries describe an address without dereferencing it. The
+    // output buffers match their information classes.
+    let queried = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            at as *const _,
+            MemoryRegionInfo,
+            (&raw mut region).cast(),
+            size_of_val(&region),
+            std::ptr::null_mut(),
+        )
+    };
+    if queried != 0 {
+        // These are the Windows SDK's named bitfields in declaration order.
+        // windows-sys exposes only the union's raw bits.
+        const PRIVATE: u32 = 1 << 0;
+        const MAPPED_DATA_FILE: u32 = 1 << 1;
+        const MAPPED_IMAGE: u32 = 1 << 2;
+        const MAPPED_PAGE_FILE: u32 = 1 << 3;
+        const MAPPED_PHYSICAL: u32 = 1 << 4;
+        // SAFETY: this union was filled by the successful query above.
+        match unsafe { region.Anonymous.Flags } {
+            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return true,
+            PRIVATE | MAPPED_IMAGE => return false,
+            _ => {}
+        }
+    }
+    // Unknown flag combinations and failed allocation queries keep the
+    // VirtualQuery type check, including for a free address.
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: the output buffer has the required layout and size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.Type == MEM_MAPPED
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
@@ -219,6 +292,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             g.absent.insert(block);
         }
     }
+}
+
+/// Whether `at` is in a view (of a section).
+fn view(at: usize) -> bool {
+    #[cfg(test)]
+    tests::QUERIED.with(|n| n.set(n.get() + 1));
+    mapped(at)
 }
 
 /// Whether nothing is committed at `at` (a placeholder between views).
@@ -268,6 +348,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+    }
+    let views: Vec<usize> = g.views.range(range.clone()).copied().collect();
+    for block in views {
+        g.views.remove(&block);
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
@@ -458,6 +542,100 @@ mod tests {
         assert!(writes(v, v + 2 * BLOCK, false).is_none());
         assert_eq!(kernel_asked(), asked + 3);
         unmap(v, 2);
+    }
+
+    #[test]
+    fn allocation_query_recognizes_file_views_and_rejects_nonviews() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(PAGE as u64).unwrap();
+        // SAFETY: a valid, open file and a read-only mapping of its contents.
+        let section = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: an open section containing at least one page.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        assert!(mapped(view.Value as usize + 13));
+        // SAFETY: our successful mapping and its section handle.
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(section);
+        }
+        assert!(!mapped((&raw const file) as usize)); // private stack allocation
+        assert!(!mapped(mapped as *const () as usize)); // executable image
+        assert!(!mapped(0)); // no allocation to query
+    }
+
+    thread_local! {
+        /// The view queries `guard` made on this thread (each test runs on
+        /// its own).
+        pub(super) static QUERIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn queried() -> usize {
+        QUERIED.with(|n| n.get())
+    }
+
+    /// A view is asked about once per block an asking starts in, again
+    /// only after the runtime remapped it; other memory every time.
+    #[test]
+    fn views_are_queried_once_until_remapped() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let at = queried();
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(guard(view + 8, view + BLOCK).is_some());
+        assert_eq!(queried(), at + 1);
+        // Another start block is asked about once.
+        assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
+        assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
+        assert_eq!(queried(), at + 2);
+        // The runtime remapped the first block: asked again.
+        title_memory_remapped(view, BLOCK);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert_eq!(queried(), at + 3);
+        // Private memory is not a view, however often asked.
+        let plain = vec![0u8; 2 * BLOCK];
+        let p = plain.as_ptr() as usize;
+        assert!(guard(p, p + 16).is_none());
+        assert!(guard(p, p + 16).is_none());
+        assert_eq!(queried(), at + 5);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
