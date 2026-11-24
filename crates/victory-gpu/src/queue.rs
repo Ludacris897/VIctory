@@ -340,6 +340,11 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     if AFTER.load(Ordering::Relaxed) == frame {
         tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
     }
+    // Every 10th frame: the brightest probed channel of the last frames,
+    // for runs nobody watches (a scene going dark shows here).
+    if frame % 10 == 0 {
+        tracing::info!(frame, levels = ?crate::capture::recent_levels(), "presented levels");
+    }
     *last = (black, drawn, last.2);
 }
 
