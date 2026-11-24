@@ -1600,6 +1600,11 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Title memory in place (`crate::inplace`) the list's shaders may
+    /// write (address, end): no copy-back, but with submissions sent ahead
+    /// ([`late`]) what reads that memory waits for the flight, as for a
+    /// declared range of a copy.
+    placed: Vec<(usize, usize)>,
 }
 
 impl Deferred {
@@ -1898,6 +1903,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Title memory its shaders may write in place ([`Deferred::placed`]).
+    placed: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -1913,6 +1920,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    placed: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -1927,8 +1935,11 @@ enum Late {
 struct Line {
     line: Vec<Late>,
     /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
+    /// order and joined: through copies, and in place.
     written: Vec<(usize, usize)>,
+    /// Of it, what they may write in place ([`Deferred::placed`]): a
+    /// refresh of another copy that reads it waits too.
+    placed: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -1955,6 +1966,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    placed: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -2031,20 +2043,20 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
+    let (written, placed) = {
         let line = line();
         if line.written.is_empty() {
             return None;
         }
-        line.written.clone()
+        (line.written.clone(), line.placed.clone())
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, &placed, runs, true)
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(written: &[(usize, usize)], placed: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -2077,7 +2089,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                // A copy brought up to date from title memory that a flight
+                // writes in place would take half-written bytes.
+                Step::Refresh(shadow, address, len) => {
+                    if !placed.is_empty() && !shadow.in_place() && touches(placed, *address, *address + *len) {
+                        if count {
+                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -3440,6 +3462,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                placed,
                 lists,
                 settling,
                 poke,
@@ -3451,15 +3474,20 @@ impl Host {
             in_hand.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            placed.clear();
             *lists = 0;
             let mut ranges = Vec::new();
+            let mut in_place = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    in_place.extend(flight.placed.iter().copied());
                 }
             }
+            ranges.extend(in_place.iter().copied());
             join_ranges(written, ranges);
+            join_ranges(placed, in_place);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -3630,8 +3658,9 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line { line: items, written, placed, lists: flying, target, .. } = &mut *line;
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()).chain(sent.placed.iter().copied()));
+            join_ranges(placed, sent.placed.iter().copied());
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3641,6 +3670,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                placed: sent.placed,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -3674,8 +3704,9 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            let Line { line: items, written, placed, lists: flying, target, .. } = &mut *line;
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()).chain(sent.placed.iter().copied()));
+            join_ranges(placed, sent.placed.iter().copied());
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3685,6 +3716,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                placed: sent.placed,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -3732,6 +3764,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.placed.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -3871,7 +3904,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, &line.placed, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -3992,6 +4025,8 @@ impl Host {
             }
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            let mut placed = Vec::new();
+            join_ranges(&mut placed, runs.iter().flat_map(|l| l.deferred().placed.clone()));
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
@@ -4000,6 +4035,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                placed,
                 writes,
             };
             working(was_working);
@@ -4902,6 +4938,16 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Shaders of the list may write title memory in place
+    /// `[address, address + len)` ([`Deferred::placed`]).
+    pub(crate) fn defer_placed_write(&self, address: usize, len: usize) {
+        let range = (address, address + len);
+        let mut d = self.deferred();
+        if !d.placed.contains(&range) {
+            d.placed.push(range);
+        }
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,

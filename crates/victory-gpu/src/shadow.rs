@@ -1746,6 +1746,12 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // With submissions sent ahead: what reads this memory before the
+            // card has run the list waits for it (`crate::host::late`).
+            if crate::host::late() {
+                let len = len.min(self.left(address));
+                list.defer_placed_write(address as usize, len as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -2458,6 +2464,11 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// Whether this is title memory in place (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// Whether shaders read and write this copy in the card's own memory
