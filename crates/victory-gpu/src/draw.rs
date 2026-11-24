@@ -87,6 +87,42 @@ impl Drop for State {
     }
 }
 
+/// D3D12 permits at most 65,535 dispatch groups per dimension.
+fn direct_dispatch_groups(x: u32, y: u32, z: u32) -> Option<u64> {
+    if [x, y, z].into_iter().any(|n| n > 65_535) {
+        return None;
+    }
+    Some(u64::from(x) * u64::from(y) * u64::from(z))
+}
+
+#[cfg(feature = "diagnostics")]
+fn direct_compute_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("VICTORY_DIAG_MAX_DIRECT_COMPUTE_GROUPS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(u64::MAX))
+}
+
+#[cfg(feature = "diagnostics")]
+fn direct_mesh_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("VICTORY_DIAG_MAX_DIRECT_MESH_GROUPS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(65_535))
+}
+
+#[cfg(test)]
+mod direct_limits_tests {
+    #[test]
+    fn dimensions_and_product_are_checked_without_overflow() {
+        use super::direct_dispatch_groups as groups;
+        assert_eq!(groups(0, 1, 1), Some(0));
+        assert_eq!(groups(64, 32, 2), Some(4096));
+        assert_eq!(groups(65_535, 65_535, 65_535), Some(65_535u64.pow(3)));
+        assert_eq!(groups(65_536, 1, 1), None);
+        assert_eq!(groups(1, u32::MAX, 1), None);
+        assert_eq!(groups(1, 1, 65_536), None);
+    }
+}
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -493,6 +529,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let Some(groups) = direct_dispatch_groups(x, y, z) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            once!(x, y, z, "invalid direct compute dispatch dimensions");
+            return;
+        };
+        if groups == 0 { return; }
+        #[cfg(feature = "diagnostics")]
+        if groups > direct_compute_limit() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("direct compute diagnostic group limit".into());
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -561,6 +609,18 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if x == 0 { return; }
+        if direct_dispatch_groups(x, 1, 1).is_none() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            once!(x, "invalid direct mesh dispatch dimensions");
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        if u64::from(x) > direct_mesh_limit() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("direct mesh diagnostic group limit".into());
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -857,7 +917,7 @@ impl State {
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
+                || (u64::from(first) + u64::from(count)).checked_mul(stride).is_none_or(|end| end > u64::from(v.size))
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
