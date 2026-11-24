@@ -135,7 +135,9 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    // (title buffers in sections' heaps from 1 on with `VICTORY_INPLACE_POOL`,
+    // the others from 2)
+    if level() < if window || pool_on() { 1 } else { 2 } {
         return None;
     }
     // View memory: known from the runtime without asking Windows. One run
@@ -170,6 +172,9 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             STATS[4].fetch_add(1, Ordering::Relaxed);
             return None;
         }
+    }
+    if !window && level() < 2 {
+        return None;
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -209,7 +214,7 @@ static POOL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// The heaps opened on the title's sections of physical pages, by the
 /// section's handle (opened once; a heap keeps its section alive).
-static SECTION_HEAPS: Mutex<BTreeMap<usize, ID3D12Heap>> = Mutex::new(BTreeMap::new());
+static SECTION_HEAPS: Mutex<BTreeMap<usize, Option<ID3D12Heap>>> = Mutex::new(BTreeMap::new());
 
 /// A buffer over `[offset, offset + len)` of the section `section` (title
 /// view memory that is one run of it, [`Cover::Run`]), placed in the heap
@@ -227,21 +232,34 @@ fn place_in_section(device: &ID3D12Device, section: usize, offset: u64, len: u64
     let heap = {
         let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         match heaps.get(&section) {
-            Some(heap) => heap.clone(),
+            Some(Some(heap)) => heap.clone(),
+            // (refused once: not asked again)
+            Some(None) => return Err(None),
             None => {
                 let started = std::time::Instant::now();
-                let heap = open(device, From::Section(section)).map_err(Some)?;
-                tracing::info!(
-                    mb = bytes >> 20,
-                    ms = started.elapsed().as_secs_f64() * 1e3,
-                    "a section of the title's physical pages opened as one host heap"
-                );
-                heaps.insert(section, heap.clone());
-                heap
+                match open(device, From::Section(section)) {
+                    Ok(heap) => {
+                        tracing::info!(
+                            mb = bytes >> 20,
+                            ms = started.elapsed().as_secs_f64() * 1e3,
+                            "a section of the title's physical pages opened as one host heap"
+                        );
+                        heaps.insert(section, Some(heap.clone()));
+                        heap
+                    }
+                    Err(e) => {
+                        tracing::warn!(mb = bytes >> 20, error = %e, "a section of the title's physical pages refused as a host heap");
+                        heaps.insert(section, None);
+                        return Err(Some(e));
+                    }
+                }
             }
         }
     };
-    let buffer = place(device, &heap, at, end - at).map_err(Some)?;
+    let buffer = place(device, &heap, at, end - at).map_err(|e| {
+        tracing::warn!(at, bytes = end - at, section_mb = bytes >> 20, error = %e, "a buffer refused in a section's heap");
+        Some(e)
+    })?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
     Ok(Placed { buffer, heap, gpu, bias: offset - at })
