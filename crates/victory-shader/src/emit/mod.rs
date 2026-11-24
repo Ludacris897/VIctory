@@ -218,6 +218,20 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with_wave_policy(c, native, p, st, io, res, false).map(|(shader, _)| shader)
+}
+
+/// Offline wave-size experiment. The ordinary runtime emitter retains its
+/// existing policy; the returned wave size is the actual DXIL requirement.
+pub fn emit_with_wave_policy(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    small_wave32: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -266,7 +280,7 @@ pub fn emit(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -276,8 +290,14 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
-    })?;
-    Ok(HostShader {
+    };
+    let l = if small_wave32 {
+        lower::lower_with_wave_policy(&parts, true)?
+    } else {
+        lower::lower(&parts)?
+    };
+    let requested = l.requested_wave_size;
+    Ok((HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -296,7 +316,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
-    })
+    }, requested))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
