@@ -47,6 +47,18 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+#[cfg(feature = "diagnostics")]
+fn refresh_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_REFRESH_ALL").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::warn!("VICTORY_REFRESH_ALL=1: every host copy refreshed whole");
+        }
+        on
+    })
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -58,6 +70,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Diagnostics: `VICTORY_REFRESH_ALL=1` takes every page as just written
+    // (every host copy refreshed whole each time: slow, but never stale).
+    #[cfg(feature = "diagnostics")]
+    if refresh_all() {
+        j.asked += 1;
+        let now = j.asked;
+        for page in first..last {
+            j.written.insert(page, now);
+        }
+        return Some((now, (first..last).map(|p| (p, now)).collect()));
+    }
     // Guarded blocks all still clean: nothing was written there, and the
     // answer is the journal's. Asking the kernel would fail (views are not
     // write-watched) and `guard`'s query walks the view's pages; for a big
