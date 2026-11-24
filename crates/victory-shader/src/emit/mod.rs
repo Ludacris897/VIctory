@@ -513,6 +513,33 @@ pub fn emit(
                 }
             }
         }
+        // `VICTORY_WAVE_LDS_RACE=1`, after everything else: the forms above once more with a
+        // write and a read of LDS in one lane-branch region left unordered between the two
+        // host waves (`lower::with_lds_race`: approximate, but no barrier in such a region),
+        // each host wave on its own last. Refused at 64 lanes is a dropped draw for sure.
+        if std::env::var_os("VICTORY_WAVE_LDS_RACE").is_some_and(|v| v == "1") {
+            let all: Vec<(&str, &ir::Program, &structure::Structured, &io::Io, &resource::Resources)> = forms
+                .iter()
+                .filter_map(|(name, f)| f.as_ref().map(|(p, st, io, res)| (*name, p, st, io, res)))
+                .chain(std::iter::once(("as given", p, st, io, res)))
+                .collect();
+            for &(name, p, st, io, res) in &all {
+                let again = lower::with_lds_race(|| emit_program(c, native, p, st, io, res));
+                report(&format!("LDS race, {name}"), &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+            if local_on && !strict {
+                for &(name, p, st, io, res) in &all {
+                    let again = lower::with_lds_race(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                    report(&format!("LDS race, local waves (APPROXIMATE, any mask), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+        }
     }
     // Cross-lane code that needs every lane of the console wave where it
     // stands (a mask operation, a lane read, a first-lane read): right once
