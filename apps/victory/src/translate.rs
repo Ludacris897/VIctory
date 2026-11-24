@@ -159,6 +159,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -180,9 +181,11 @@ pub fn run(
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines})");
+    let mut scanned = 0usize;
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -191,10 +194,21 @@ pub fn run(
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
+            scanned += 1;
+            if scanned % 256 == 0 {
+                eprintln!("translate: scanned {scanned} files, elapsed {:.1}s", started.elapsed().as_secs_f64());
+            }
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
             let jobs = sources(&data);
+            if jobs.is_empty() {
+                continue;
+            }
+            let job_count = jobs.len();
+            let completed = AtomicUsize::new(0);
+            let file_started = std::time::Instant::now();
+            eprintln!("translate: {}: {job_count} candidate containers", entry.path().display());
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
@@ -214,6 +228,11 @@ pub fn run(
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n % 256 == 0 || n == job_count {
+                                let seconds = file_started.elapsed().as_secs_f64();
+                                eprintln!("translate: {n}/{job_count} candidates ({:.1}%), {:.1}/s, elapsed {:.1}s", 100.0 * n as f64 / job_count as f64, n as f64 / seconds.max(0.001), started.elapsed().as_secs_f64());
+                            }
                         }
                         lock(&total).merge(t);
                     });
@@ -221,6 +240,7 @@ pub fn run(
             });
         }
     }
+    eprintln!("translate: completed scan of {scanned} files in {:.1}s", started.elapsed().as_secs_f64());
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
