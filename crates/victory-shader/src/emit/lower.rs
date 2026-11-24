@@ -6835,12 +6835,25 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        // An index at or past the declared vertex count is undefined on
+        // the host (D3D12 mesh shaders) and can hang the GPU: cull such a
+        // primitive instead.
+        let max_vertices = self.s.mesh.map(|m| m.max_vertices);
+        let mut indices = Vec::new();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            if let Some(n) = max_vertices {
+                let n = self.s.m.i32(n);
+                let past = self.s.m.cmp(c, pred::IUGE, i, n);
+                culled = self.s.m.bin(c, Bin::Or, culled, past);
+            }
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
