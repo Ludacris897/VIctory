@@ -6034,7 +6034,7 @@ impl<'a> Lower<'a> {
                     self.cross_lane(true)?;
                     let scale = if op == 61 {
                         let bias = addr_val(self, 0)?;
-                        let bias = self.as_float(bias);
+                        let bias = to_float(self, bias);
                         Some(self.unary(21, bias))
                     } else {
                         None
