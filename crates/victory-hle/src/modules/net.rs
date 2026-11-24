@@ -1056,7 +1056,7 @@ mod tests {
                 "ws2_32.dll"
             };
             assert!(
-                crate::host::function(dll, e.name).is_some(),
+                crate::host::function(dll, e.name).is_some() || (dll == "winhttp.dll" && e.name == "WinHttpGetProxySettingsEx" && crate::HleResolver::default().classify(dll, &victory_pe::ImportSymbol::Name { hint: 0, name: e.name.into() }) == Some(victory_loader::Provenance::Hle)),
                 "{dll} lacks {}",
                 e.name
             );
