@@ -127,10 +127,12 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// [`CONSOLE_FLOW_FALLBACK`]), `stride` (structured reads of unknown
 /// stride through the runtime stride table, upstream #704), `gather4l`
 /// (`image_gather4_l` as a plain gather, upstream #694) and `sbuf` (a
-/// buffer descriptor read as data whose other use is `s_buffer_load`).
+/// buffer descriptor read as data whose other use is `s_buffer_load`) and
+/// `ushort` (byte and halfword buffer loads, upstream #1572) and `maskphi`
+/// (a lane mask joined with data and read as data: undefined on its edge).
 /// With all four the scene went black in game; off, those shaders are
 /// dropped as before.
-pub const TRIALS: [&str; 4] = ["console", "stride", "gather4l", "sbuf"];
+pub const TRIALS: [&str; 6] = ["console", "stride", "gather4l", "sbuf", "ushort", "maskphi"];
 
 /// The value of `VICTORY_TRIALS` as the translation reads it (part of
 /// the shader cache key).
