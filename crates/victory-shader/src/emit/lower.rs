@@ -991,7 +991,12 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    // With [`with_lds_race`]: such a region is taken anyway, its write and read left in
+    // whatever order the two host waves run them. No barrier goes inside it, so nothing can
+    // wait for threads that never come; what can go wrong is a read of the other half's word
+    // before its write. shortcut: the last resort for programs that otherwise keep 64-lane
+    // waves, which a 32-lane host refuses outright (the draws of them dropped).
+    if (0..n).any(|r| reads[r] && writes[r]) && !lds_race() {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1007,6 +1012,25 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+thread_local! {
+    /// See [`with_lds_race`].
+    static LDS_RACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with a write and a read of LDS in one lane-branch region taken anyway
+/// ([`lds_meetings`]): `super::emit`'s last resort with `VICTORY_WAVE_LDS_RACE=1`, for
+/// programs every other form leaves at 64 lanes.
+pub(super) fn with_lds_race<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_RACE.replace(true);
+    let r = f();
+    LDS_RACE.set(was);
+    r
+}
+
+fn lds_race() -> bool {
+    LDS_RACE.get()
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
