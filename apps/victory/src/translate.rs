@@ -68,6 +68,7 @@ struct Tally {
     cs_native_wave_pipelines: [usize; 2],
     cs_requested_wave_emitted: [usize; 3],
     cs_requested_wave_pipelines: [usize; 3],
+    wave64_groups: BTreeMap<(bool, u32, u32), (usize, usize)>,
     stage_skipped: usize,
     /// The same for mesh programs.
     ms_programs: usize,
@@ -132,6 +133,11 @@ impl Tally {
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
         self.stage_skipped += other.stage_skipped;
+        for (key, (emitted, accepted)) in other.wave64_groups {
+            let entry = self.wave64_groups.entry(key).or_default();
+            entry.0 += emitted;
+            entry.1 += accepted;
+        }
         for i in 0..3 {
             self.cs_requested_wave_emitted[i] += other.cs_requested_wave_emitted[i];
             self.cs_requested_wave_pipelines[i] += other.cs_requested_wave_pipelines[i];
@@ -317,6 +323,10 @@ pub fn run(
     for (i, label) in ["unspecified", "32", "64"].into_iter().enumerate() {
         println!("compute requested wave {label}: {} emitted, {} pipelines", t.cs_requested_wave_emitted[i], t.cs_requested_wave_pipelines[i]);
     }
+    for ((lanes, threads, lds), (emitted, accepted)) in &t.wave64_groups {
+        let reason = if *lanes { "lane-dependent" } else { "LDS-only" };
+        println!("wave64 inventory: {reason}, threads={threads}, lds_bytes={lds}: {emitted} emitted, {accepted} pipelines");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -368,7 +378,8 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let identity = blake3::hash(dxil);
+    if !lock(seen).insert(identity) {
         t.duplicates += 1;
         return;
     }
@@ -376,7 +387,7 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    for p in programs {
+    for (program_index, p) in programs.into_iter().enumerate() {
         if compute_only && p.stage != HwStage::Cs {
             t.stage_skipped += 1;
             continue;
@@ -440,10 +451,10 @@ fn translate(
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit_with_wave_policy(&container, &p, &program, &s, &i, &r, small_wave32) {
-                        Ok((shader, requested)) => {
+                        Ok((shader, requested, console_lanes)) => {
                             *counter(t, p.stage, 1) += 1;
                             let before = t.cs_pipelines;
-                            check(shader, t, checks, label);
+                            check(shader, t, checks, &label);
                             if compute {
                                 let i = usize::from(p.wave64);
                                 t.cs_native_wave_emitted[i] += 1;
@@ -451,6 +462,22 @@ fn translate(
                                 let j = match requested { Some(32) => 1, Some(64) => 2, _ => 0 };
                                 t.cs_requested_wave_emitted[j] += 1;
                                 t.cs_requested_wave_pipelines[j] += t.cs_pipelines - before;
+                                if p.wave64 {
+                                    if let victory_shader::native::StageIo::Cs(cs) = &p.io {
+                                        let threads = cs.threads.iter().product::<u32>();
+                                        let lds = cs.lds_bytes();
+                                        let accepted = t.cs_pipelines - before;
+                                        if requested == Some(64) {
+                                            let entry = t.wave64_groups.entry((console_lanes, threads, lds)).or_default();
+                                            entry.0 += 1;
+                                            entry.1 += accepted;
+                                        }
+                                        if std::env::var_os("VICTORY_TRANSLATE_WAVE_DETAILS").is_some() {
+                                            let wave = requested.unwrap_or(0);
+                                            t.lines.push(format!("wave_detail\t{identity}:{program_index}\t{wave}\t{console_lanes}\t{threads}\t{lds}\t{accepted}\t{}", label()));
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
