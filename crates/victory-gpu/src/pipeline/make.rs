@@ -379,8 +379,14 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers =
-            pipeline_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        // `VICTORY_PIPELINE_WORKERS=<n>` sets the count (1 to 32): a first run
+        // makes thousands of pipelines, and the driver takes seconds over each.
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 32))
+            .unwrap_or_else(|| pipeline_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get())));
+        tracing::info!(workers, "host pipeline workers");
         let cap = early_cap_for(
             workers,
             std::env::var("VICTORY_EARLY_WORKERS").ok().as_deref(),
