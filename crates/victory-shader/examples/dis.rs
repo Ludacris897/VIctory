@@ -8,7 +8,7 @@ fn main() {
         println!("stage {:?} wave64 {} vgprs {} io {:?}", p.stage, p.wave64, p.vgprs, p.io);
         println!("layout {:?}", p.layout);
         let code = p.patched_code();
-        for i in gfx10::decode(&code).unwrap() { println!("{}", i.text(p.wave64)); }
+        for i in gfx10::decode(&code).unwrap() { println!("{:04x} {}", i.offset, i.text(p.wave64)); }
     }
     let t = if std::env::var("NV").is_ok() { emit::Target { lanes_min: 32, lanes_max: 32 } } else { emit::Target::ANY };
     match emit::translate_for(&bytes, t) {
