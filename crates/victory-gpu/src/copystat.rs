@@ -52,8 +52,17 @@ pub(crate) enum C {
     /// Dynamic view slots taken, and requests refused.
     DynTaken,
     DynFailed,
+    /// Rectangle draws run through a pipeline's rectangle geometry stage,
+    /// direct and indirect.
+    RectGsDraws,
+    RectGsIndirect,
+    /// Lists run again after their dynamic slots were given back.
+    Resubmits,
 }
-const COUNTERS: usize = 31;
+const COUNTERS: usize = 34;
+
+/// Pipelines made with a rectangle geometry stage, so far.
+pub(crate) static RECT_GS_PIPELINES: AtomicU64 = AtomicU64::new(0);
 
 /// The most dynamic view slots in use at once since the last log, of how
 /// many.
@@ -170,6 +179,17 @@ pub(crate) fn log(frames: f64) {
         c[C::DynFailed as usize],
         DYN_PEAK.swap(0, Relaxed),
         DYN_CAP.load(Relaxed),
+    );
+    for (capacity, free, largest) in crate::descriptor::dynamic_report() {
+        tracing::info!(capacity, free, largest, "dynamic view slots now: free, and the largest free run");
+    }
+    tracing::info!(
+        "rectangles per frame: {:.0} draws and {:.0} indirect draws through a geometry stage; {} \
+         such pipelines so far; {:.1} lists run again after their slots were given back",
+        c[C::RectGsDraws as usize],
+        c[C::RectGsIndirect as usize],
+        RECT_GS_PIPELINES.load(Relaxed),
+        c[C::Resubmits as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

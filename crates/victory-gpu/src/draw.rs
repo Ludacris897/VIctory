@@ -217,6 +217,8 @@ impl State {
             return;
         }
         if self.released {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Resubmits, 1);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!("a list run again without a reset: its fresh tables may have been reused")
@@ -1221,6 +1223,10 @@ impl State {
         // vertices as they are.
         let rects = self.topology == RECTANGLES && !self.rect_gs();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        #[cfg(feature = "diagnostics")]
+        if ran && self.topology == RECTANGLES && !rects {
+            crate::copystat::add(crate::copystat::C::RectGsDraws, 1);
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -1412,7 +1418,14 @@ impl State {
                 self.fail = "rectangle list topology";
                 false
             }
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => {
+                let ran = self.prepare(list, kind == INDEXED);
+                #[cfg(feature = "diagnostics")]
+                if ran && self.topology == RECTANGLES {
+                    crate::copystat::add(crate::copystat::C::RectGsIndirect, 1);
+                }
+                ran
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),

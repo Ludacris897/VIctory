@@ -569,6 +569,10 @@ impl HostPipeline {
             .then(|| rect_gs(&code_bytes(&code(0))))
             .flatten();
         let mut raster = g.rasterizer;
+        #[cfg(feature = "diagnostics")]
+        if gs.is_some() {
+            crate::copystat::RECT_GS_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if gs.is_some() {
             // Which way a rectangle's three vertices wind means nothing.
             raster.CullMode = D3D12_CULL_MODE_NONE;

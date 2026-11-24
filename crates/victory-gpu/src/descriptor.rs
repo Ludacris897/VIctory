@@ -161,6 +161,21 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// For each shader-visible view heap with dynamic slots: capacity, free
+/// slots, and the largest free run (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dynamic_report() -> Vec<(u32, u32, u32)> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .filter_map(|&(_, _, h)| match unsafe { &*(h as *const Heap) }.host.get() {
+            Some(Some(host)) => host.dynamic_stats(),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

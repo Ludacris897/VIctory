@@ -158,12 +158,20 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        #[cfg(feature = "diagnostics")]
+                        TRANSLATE_ERRORS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert_with(HashMap::new)
+                            .insert(self.hash.clone(), e.to_string());
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        )
+                    }
                 }
                 done.ok()
             })
@@ -254,6 +262,20 @@ pub(crate) fn making() -> u64 {
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Why each shader that does not translate does not (by hash).
+#[cfg(all(windows, feature = "diagnostics"))]
+static TRANSLATE_ERRORS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Why the shader `hash` does not translate, if it does not (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn translate_error(hash: &str) -> Option<String> {
+    TRANSLATE_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(hash).cloned())
+}
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]

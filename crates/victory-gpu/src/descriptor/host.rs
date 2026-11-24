@@ -315,6 +315,23 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// Capacity, free slots and the largest free run of the dynamic range
+    /// (view heaps; diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dynamic_stats(&self) -> Option<(u32, u32, u32)> {
+        if self.sampler || self.dynamic == 0 {
+            return None;
+        }
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut free, mut largest, mut run) = (0u32, 0u32, 0u32);
+        for &taken in &guard.1 {
+            run = if taken { 0 } else { run + 1 };
+            free += u32::from(!taken);
+            largest = largest.max(run);
+        }
+        Some((self.dynamic, free, largest))
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {

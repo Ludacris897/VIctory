@@ -2000,9 +2000,41 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                // A shader that does not translate: why, after its hash; and
+                // the drops summed by that reason, most first.
+                let error_of = |why: &str| {
+                    why.split(|c: char| !c.is_ascii_hexdigit())
+                        .filter(|w| w.len() == 16)
+                        .find_map(crate::pipeline::translate_error)
+                        .map(|e| {
+                            let e = e.rsplit(": ").next().unwrap_or(&e).trim().to_owned();
+                            e.trim_end_matches(" is not supported").to_owned()
+                        })
+                };
+                let mut by_reason: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                for (why, n) in &drops {
+                    if let Some(e) = error_of(why) {
+                        *by_reason.entry(e).or_default() += n;
+                    }
+                }
                 for (why, n) in drops.iter().take(40) {
+                    match error_of(why) {
+                        Some(e) => tracing::info!(
+                            "dropped {:.1}/frame without a host pipeline: {why} (does not translate: {e})",
+                            *n as f64 / frames
+                        ),
+                        None => tracing::info!(
+                            "dropped {:.1}/frame without a host pipeline: {why}",
+                            *n as f64 / frames
+                        ),
+                    }
+                }
+                let mut by_reason: Vec<_> = by_reason.into_iter().collect();
+                by_reason.sort_by(|a, b| b.1.cmp(&a.1));
+                for (e, n) in by_reason.iter().take(15) {
                     tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        "untranslated shaders' drops by reason: {:.1}/frame: {e}",
                         *n as f64 / frames
                     );
                 }

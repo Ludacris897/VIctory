@@ -27,6 +27,30 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+        || REQUESTED.load(std::sync::atomic::Ordering::Relaxed) == n
+}
+
+/// A frame asked for with F9 (see [`poll_hotkey`]).
+static REQUESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of frame `frame`, with `VICTORY_CAPTURE` set: F9 (held
+/// or tapped since the last present) lists frame `frame + 2`, whose
+/// draws are all recorded after this point: saved, its targets dumped
+/// with `VICTORY_DUMP_TARGETS`, and its draws traced.
+pub(crate) fn poll_hotkey(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+    if folder().is_none() {
+        return;
+    }
+    // SAFETY: a plain query. Bit 0: pressed since the last call.
+    let state = unsafe { GetAsyncKeyState(i32::from(VK_F9.0)) };
+    let requested = REQUESTED.load(Relaxed);
+    let busy = requested != u64::MAX && requested >= frame;
+    if state & 1 != 0 && !busy {
+        REQUESTED.store(frame + 2, Relaxed);
+        tracing::warn!(frame = frame + 2, folder = ?folder(), "F9: capturing a frame and its targets");
+    }
 }
 
 /// Whether frame `n` is saved.
