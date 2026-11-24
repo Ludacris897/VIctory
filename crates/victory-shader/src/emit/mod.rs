@@ -123,6 +123,30 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// Whether the console-flow fallback for lane masks read as data (see
+/// [`CONSOLE_FLOW_FALLBACK`]) is on: `VICTORY_CONSOLE_FALLBACK=1`. Off by
+/// default: on the first run with it the scene went black right after
+/// one such translation was first used.
+pub fn console_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("VICTORY_CONSOLE_FALLBACK").ok().as_deref(),
+            Some("1" | "on" | "true")
+        )
+    })
+}
+
+thread_local! {
+    static TOOK_CONSOLE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last translation on this thread took the console-flow
+/// fallback (cleared by the call), for the GPU side to name it in its log.
+pub fn took_console_fallback() -> bool {
+    TOOK_CONSOLE_FALLBACK.with(|c| c.replace(false))
+}
+
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -435,6 +459,7 @@ pub fn emit(
         // every lane's bit, for a compute group of one console wave.
         Err(ShaderError::Unsupported { what, .. })
             if CONSOLE_FLOW_FALLBACK.contains(&what)
+                && console_fallback()
                 && one_console_wave(native)
                 && target.runs(if native.wave64 { 64 } else { 32 }) =>
         {
@@ -445,7 +470,9 @@ pub fn emit(
                     parts.console_cf = true;
                     let l = lower::lower(&parts).map_err(|_| e);
                     parts.st = st;
-                    l?
+                    let l = l?;
+                    TOOK_CONSOLE_FALLBACK.with(|c| c.set(true));
+                    l
                 }
                 Err(_) => return Err(e),
             }

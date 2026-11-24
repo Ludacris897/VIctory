@@ -51,6 +51,9 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        if victory_shader::emit::console_fallback() {
+            tracing::warn!("VICTORY_CONSOLE_FALLBACK: one-wave lane-mask shaders take console flow");
+        }
         let spin = victory_shader::emit::spin_limit();
         if spin != victory_shader::emit::DEFAULT_SPIN_LIMIT {
             tracing::warn!(
@@ -62,6 +65,7 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&spin.to_le_bytes());
+                bytes.push(u8::from(victory_shader::emit::console_fallback()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

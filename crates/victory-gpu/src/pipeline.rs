@@ -143,6 +143,13 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                if victory_shader::emit::took_console_fallback() {
+                    tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        "shader translated through console flow (VICTORY_CONSOLE_FALLBACK)"
+                    );
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
