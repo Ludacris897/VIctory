@@ -49,8 +49,21 @@ pub(crate) enum C {
     /// compared at copy-back).
     BackRanges,
     BackBytes,
+    /// Dynamic view slots taken, and requests refused.
+    DynTaken,
+    DynFailed,
 }
-const COUNTERS: usize = 29;
+const COUNTERS: usize = 31;
+
+/// The most dynamic view slots in use at once since the last log, of how
+/// many.
+static DYN_PEAK: AtomicU64 = AtomicU64::new(0);
+static DYN_CAP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn dynamic_in_use(in_use: u32, of: u32) {
+    DYN_PEAK.fetch_max(u64::from(in_use), Relaxed);
+    DYN_CAP.store(u64::from(of), Relaxed);
+}
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -150,6 +163,13 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BottomUs as usize]),
         c[C::BackRanges as usize],
         mb(c[C::BackBytes as usize]),
+    );
+    tracing::info!(
+        "dynamic view slots per frame: {:.0} taken, {:.0} requests refused; at most {} of {} in use",
+        c[C::DynTaken as usize],
+        c[C::DynFailed as usize],
+        DYN_PEAK.swap(0, Relaxed),
+        DYN_CAP.load(Relaxed),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

@@ -33,6 +33,8 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// Dynamic slots not taken (kept with `next`, under its lock).
+    free: std::sync::atomic::AtomicU32,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -170,6 +172,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -252,6 +255,15 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        // Fewer free than asked: no run of them can be had, and the scan
+        // below (the whole pool) would be wasted, hundreds of times a frame
+        // once the pool is full.
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.free.load(Relaxed) < n {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::DynFailed, 1);
+            return None;
+        }
         let (next, taken) = &mut *guard;
         let n = n as usize;
         // Search from `next` on, then from the start.
@@ -274,9 +286,18 @@ impl HostHeap {
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::DynFailed, 1);
             return None;
         };
         taken[first..first + n].fill(true);
+        let left = self.free.fetch_sub(n as u32, Relaxed) - n as u32;
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::DynTaken, n as u64);
+            crate::copystat::dynamic_in_use(self.dynamic - left, self.dynamic);
+        }
+        let _ = left;
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -298,7 +319,9 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let given = slots.iter().filter(|&&t| t).count() as u32;
             slots.fill(false);
+            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -539,6 +562,11 @@ impl HostHeap {
             let before = TOP.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
             if index >> 16 > before >> 16 {
                 tracing::info!(index, count = self.count, "highest title view slot so far");
+            }
+            static LOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+            let before = LOW.fetch_min(index, std::sync::atomic::Ordering::Relaxed);
+            if index >> 16 < before >> 16 {
+                tracing::info!(index, count = self.count, "lowest title view slot so far");
             }
         }
         // SAFETY: the handle is a descriptor slot in title memory.
