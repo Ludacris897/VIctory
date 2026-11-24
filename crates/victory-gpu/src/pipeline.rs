@@ -82,6 +82,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            #[cfg(feature = "diagnostics")]
+            dump_container(stage, &full.to_hex()[..16], bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
@@ -91,6 +93,39 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+/// Diagnostics: with `VICTORY_DUMP_SHADERS=<folder>`, every console shader
+/// container is written there once as `<stage>-<hash>.bin` (the hash the
+/// pipeline diagnostics print), for offline translation. With
+/// `VICTORY_DUMP_SHADERS=<folder>;<hash>,<hash>` only those.
+#[cfg(feature = "diagnostics")]
+fn dump_container(stage: &str, hash: &str, bytes: &[u8]) {
+    static TO: OnceLock<Option<(std::path::PathBuf, Vec<String>)>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let value = std::env::var("VICTORY_DUMP_SHADERS").ok()?;
+        let (dir, only) = value.split_once(';').unwrap_or((value.as_str(), ""));
+        let dir = std::path::PathBuf::from(dir.trim());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, ?dir, "VICTORY_DUMP_SHADERS: no folder");
+            return None;
+        }
+        let only = only
+            .split([',', ' '])
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        tracing::warn!(?dir, "VICTORY_DUMP_SHADERS: console shaders written there");
+        Some((dir, only))
+    });
+    let Some((dir, only)) = to else { return };
+    if !only.is_empty() && !only.iter().any(|h| h == hash) {
+        return;
+    }
+    let path = dir.join(format!("{stage}-{hash}.bin"));
+    if let Err(e) = std::fs::write(&path, bytes) {
+        tracing::warn!(error = %e, ?path, "a console shader not dumped");
+    }
 }
 
 /// A translated shader and the console resources its code reads.

@@ -124,6 +124,15 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&host_lists);
+        // Their submission has run: the slots their tables took go back.
+        // (A submission may name a list twice: once each.)
+        let mut seen: Vec<This> = Vec::with_capacity(lists.len());
+        for &l in lists {
+            if !seen.contains(&l) {
+                seen.push(l);
+                crate::list::executed(l);
+            }
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

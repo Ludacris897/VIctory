@@ -73,6 +73,23 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// The dynamic slots of a capped heap: [`MIN_DYNAMIC`], or
+/// `VICTORY_DYNAMIC_SLOTS` (diagnostics builds; 2^16 to 2^19), which takes
+/// them from the title's slots past the rest (a title reading those gets
+/// its tables there made afresh, from dynamic slots too).
+fn capped_dynamic() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    if let Some(n) = std::env::var("VICTORY_DYNAMIC_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        let n = n.clamp(MIN_DYNAMIC, 1 << 19);
+        tracing::warn!(n, "VICTORY_DYNAMIC_SLOTS: dynamic slots of a capped view heap");
+        return n;
+    }
+    MIN_DYNAMIC
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -106,13 +123,20 @@ impl HostHeap {
         } else if let Ok(heap) = make(count + DYNAMIC) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+            let min = capped_dynamic();
+            match make(count + min) {
+                Ok(heap) => (heap, count, min),
+                Err(e) if count + min > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        dynamic = min,
+                        title_slots = PORTABLE_VIEWS - min,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - min, min)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -394,6 +418,16 @@ impl HostHeap {
                 );
             }
             return None;
+        }
+        // Diagnostic: the highest title slot read or written, each time it
+        // passes another 2^16 (how much of a capped heap the title uses).
+        #[cfg(feature = "diagnostics")]
+        if !self.sampler {
+            static TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let before = TOP.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+            if index >> 16 > before >> 16 {
+                tracing::info!(index, count = self.count, "highest title view slot so far");
+            }
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };

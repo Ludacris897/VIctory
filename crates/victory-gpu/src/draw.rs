@@ -82,6 +82,9 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// The list's dynamic slots were given back after it ran (see
+    /// [`State::executed`]); set until the list is reset.
+    released: bool,
 }
 
 impl Drop for State {
@@ -173,6 +176,33 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// After a submission of the list has run (submissions are waited
+    /// for): its dynamic slots go back at once rather than at its next
+    /// reset. Titles keep many recorded lists between resets (a ring per
+    /// frame), and on hosts whose view heaps are capped (NVIDIA: 2^16
+    /// dynamic slots) the slots those idle lists held ran out within a
+    /// minute of the world, dropping every draw with a fresh table after.
+    /// A list run again without a reset would read slots others may have
+    /// made since: that is reported.
+    pub(crate) fn executed(&mut self) {
+        if self.released {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a list run again without a reset: its fresh tables may have been reused")
+            });
+            return;
+        }
+        if self.dynamic.is_empty() {
+            return;
+        }
+        for (heap, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+        self.fresh_tables.clear();
+        self.root_srv_slots.clear();
+        self.released = true;
     }
 
     /// The title's topology; console-only ones become host lists (see
