@@ -60,22 +60,23 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    // Reserve work without allowing the 32-bit counter to wrap. A failed
-    // reservation must not increment the budget, even under contention.
+    // Reserve without overflow. Keep retries bounded and the loop exit
+    // independent of UAV data for the legacy cs_5_1 compiler.
     if (cost == 0) return;
     uint before;
     budget.InterlockedAdd(0, 0, before);
-    [allow_uav_condition]
-    while (true) {
-        if (before >= BUDGET || cost > BUDGET - before) {
-            args.Store(at, 0);
-            return;
+    bool reserved = false;
+    [loop]
+    for (uint attempt = 0; attempt < 128; ++attempt) {
+        if (!reserved && before < BUDGET && cost <= BUDGET - before) {
+            uint observed;
+            budget.InterlockedCompareExchange(0, before, before + cost, observed);
+            reserved = (observed == before);
+            before = observed;
         }
-        uint observed;
-        budget.InterlockedCompareExchange(0, before, before + cost, observed);
-        if (observed == before) return;
-        before = observed;
     }
+    // Contention or a full budget: fail closed, never admit excess work.
+    if (!reserved) args.Store(at, 0);
 }
 "#;
 
@@ -129,6 +130,8 @@ fn make() -> windows::core::Result<Clamp> {
                 std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            #[cfg(test)]
+            eprintln!("FXC argument clamp diagnostic: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
@@ -136,7 +139,11 @@ fn make() -> windows::core::Result<Clamp> {
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).map_err(|e| {
+            #[cfg(test)]
+            eprintln!("Clamp root signature creation failed: {e}");
+            e
+        })?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -144,6 +151,10 @@ fn make() -> windows::core::Result<Clamp> {
                 BytecodeLength: bytes.len(),
             },
             ..Default::default()
+        }).map_err(|e| {
+            #[cfg(test)]
+            eprintln!("Clamp PSO creation failed: {e}");
+            e
         })?;
         Ok(Clamp { root, pso })
     }
@@ -253,6 +264,6 @@ mod tests {
         if super::host().is_none() {
             return; // no host GPU here
         }
-        assert!(super::clamp().is_some());
+        super::make().unwrap_or_else(|e| panic!("argument clamp build failed: {e}"));
     }
 }
