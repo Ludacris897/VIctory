@@ -32,6 +32,7 @@ enum Val {
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     pub requested_wave_size: Option<u32>,
+    pub console_lanes: bool,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -905,6 +906,7 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             requested_wave_size: self.s.wave_size,
+            console_lanes: self.console_lanes,
             cmp_samplers,
             root_cbvs,
             root_srvs,
