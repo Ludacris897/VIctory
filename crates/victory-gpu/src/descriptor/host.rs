@@ -506,20 +506,6 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// Whether this is a sampler heap.
-    pub(crate) fn is_sampler(&self) -> bool {
-        self.sampler
-    }
-
-    /// The shader-visible handle of slot `index`.
-    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
-        }
-    }
-
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
