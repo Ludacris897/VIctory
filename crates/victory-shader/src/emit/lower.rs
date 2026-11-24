@@ -58,16 +58,19 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
+    /// Experimental lowering turned out to use host wave operations.
+    RetryOriginalWave,
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave_policy(parts, false)
+    lower_with_wave_policy(parts, false, false)
 }
 
-pub(crate) fn lower_with_wave_policy(parts: &Parts, small_wave32: bool) -> Result<Lowered, ShaderError> {
+pub(crate) fn lower_with_wave_policy(parts: &Parts, small_wave32: bool, cross_warp_lds: bool) -> Result<Lowered, ShaderError> {
+    let mut cross_warp_lds = cross_warp_lds;
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, small_wave32).run() {
+        match Lower::new(parts, &bad, small_wave32, cross_warp_lds).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -76,6 +79,10 @@ pub(crate) fn lower_with_wave_policy(parts: &Parts, small_wave32: bool) -> Resul
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            Err(Stop::RetryOriginalWave) => {
+                cross_warp_lds = false;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -176,6 +183,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Offline-only experiment; the entire workgroup follows one straight-line path.
+    cross_warp_lds: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -344,8 +353,14 @@ fn required_wave(wave: u32, threads: u32, lds: u32, console_lanes: bool, small_w
     None
 }
 
+/// A single console wave becomes two host warps. Only straight-line
+/// compute code with no detected lane dependencies can use this trial.
+fn cross_warp_candidate(wave: u32, threads: u32, lds: u32, console_lanes: bool, straight_line: bool) -> bool {
+    wave == 64 && (33..=64).contains(&threads) && lds > 0 && !console_lanes && straight_line
+}
+
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, small_wave32: bool) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, small_wave32: bool, cross_warp_trial: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -362,6 +377,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut cross_warp_lds = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -401,10 +417,20 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            s.wave_size = required_wave(
-                wave, cs.threads.iter().product::<u32>(), s.lds_dwords,
-                console_lanes, small_wave32,
-            );
+            let threads = cs.threads.iter().product::<u32>();
+            s.wave_size = required_wave(wave, threads, s.lds_dwords, console_lanes, small_wave32);
+            // Do not introduce group barriers into divergent branches,
+            // loops, whole-wave sections, or wave-dependent scalar reads.
+            let straight_line = p.blocks.len() == 1
+                && matches!(x.st.exits.first(), Some(LaneExit::End))
+                && x.st.guards.iter().flatten().all(|g| g.is_none())
+                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
+                && insts().any(|i| matches!(i.fields, Fields::Ds { .. }));
+            cross_warp_lds = cross_warp_trial
+                && cross_warp_candidate(wave, threads, s.lds_dwords, console_lanes, straight_line);
+            if cross_warp_lds {
+                s.wave_size = Some(32);
+            }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -488,6 +514,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            cross_warp_lds,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -850,6 +877,9 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        if self.cross_warp_lds && self.sections.values().any(|s| !s.is_empty()) {
+            return Err(Stop::RetryOriginalWave);
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -885,6 +915,10 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
+                if self.cross_warp_lds && matches!(p.blocks[b].insts[i].fields, Fields::Ds { .. }) {
+                    let mode = self.s.m.i32(1 | 8);
+                    self.s.op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -899,6 +933,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.cross_warp_lds && self.s.flags & flags::WAVE_OPS != 0 {
+            return Err(Stop::RetryOriginalWave);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -6599,6 +6636,19 @@ mod tests {
         assert_eq!(required_wave(64, 32, 0, false, true), None);
         assert_eq!(required_wave(32, 32, 16, false, true), Some(32));
         assert_eq!(required_wave(64, 0, 16, false, true), Some(64));
+    }
+
+    #[test]
+    fn cross_warp_lds_policy_requires_straight_line_wave64() {
+        use super::cross_warp_candidate;
+        assert!(cross_warp_candidate(64, 64, 16, false, true));
+        assert!(cross_warp_candidate(64, 33, 16, false, true));
+        assert!(!cross_warp_candidate(64, 32, 16, false, true));
+        assert!(!cross_warp_candidate(64, 65, 16, false, true));
+        assert!(!cross_warp_candidate(32, 32, 16, false, true));
+        assert!(!cross_warp_candidate(64, 64, 0, false, true));
+        assert!(!cross_warp_candidate(64, 64, 16, true, true));
+        assert!(!cross_warp_candidate(64, 64, 16, false, false));
     }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
