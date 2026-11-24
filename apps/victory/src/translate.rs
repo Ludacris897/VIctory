@@ -66,6 +66,8 @@ struct Tally {
     cs_pipelines: usize,
     cs_native_wave_emitted: [usize; 2],
     cs_native_wave_pipelines: [usize; 2],
+    cs_requested_wave_emitted: [usize; 3],
+    cs_requested_wave_pipelines: [usize; 3],
     stage_skipped: usize,
     /// The same for mesh programs.
     ms_programs: usize,
@@ -130,6 +132,10 @@ impl Tally {
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
         self.stage_skipped += other.stage_skipped;
+        for i in 0..3 {
+            self.cs_requested_wave_emitted[i] += other.cs_requested_wave_emitted[i];
+            self.cs_requested_wave_pipelines[i] += other.cs_requested_wave_pipelines[i];
+        }
         for i in 0..2 {
             self.cs_native_wave_emitted[i] += other.cs_native_wave_emitted[i];
             self.cs_native_wave_pipelines[i] += other.cs_native_wave_pipelines[i];
@@ -169,6 +175,8 @@ pub fn run(
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let compute_only = std::env::var_os("VICTORY_TRANSLATE_COMPUTE_ONLY").is_some();
+    let small_wave32 = std::env::var_os("VICTORY_TRANSLATE_SMALL_WAVE32").is_some();
+    anyhow::ensure!(!small_wave32 || compute_only, "small wave32 experiment requires compute-only translation");
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -194,7 +202,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines}, compute_only={compute_only})");
+    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines}, compute_only={compute_only}, small_wave32={small_wave32})");
     let mut scanned = 0usize;
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -237,7 +245,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only);
+                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only, small_wave32);
                             let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             if n % 256 == 0 || n == job_count {
                                 let seconds = file_started.elapsed().as_secs_f64();
@@ -306,6 +314,9 @@ pub fn run(
     for (i, wave) in [32, 64].into_iter().enumerate() {
         println!("compute native wave{wave}: {} emitted, {} pipelines", t.cs_native_wave_emitted[i], t.cs_native_wave_pipelines[i]);
     }
+    for (i, label) in ["unspecified", "32", "64"].into_iter().enumerate() {
+        println!("compute requested wave {label}: {} emitted, {} pipelines", t.cs_requested_wave_emitted[i], t.cs_requested_wave_pipelines[i]);
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -344,6 +355,7 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
     compute_only: bool,
+    small_wave32: bool,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -427,8 +439,8 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
-                        Ok(shader) => {
+                    match emit::emit_with_wave_policy(&container, &p, &program, &s, &i, &r, small_wave32) {
+                        Ok((shader, requested)) => {
                             *counter(t, p.stage, 1) += 1;
                             let before = t.cs_pipelines;
                             check(shader, t, checks, label);
@@ -436,6 +448,9 @@ fn translate(
                                 let i = usize::from(p.wave64);
                                 t.cs_native_wave_emitted[i] += 1;
                                 t.cs_native_wave_pipelines[i] += t.cs_pipelines - before;
+                                let j = match requested { Some(32) => 1, Some(64) => 2, _ => 0 };
+                                t.cs_requested_wave_emitted[j] += 1;
+                                t.cs_requested_wave_pipelines[j] += t.cs_pipelines - before;
                             }
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
