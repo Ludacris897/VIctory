@@ -1026,8 +1026,20 @@ impl State {
             },
             None => None,
         };
+        #[cfg(feature = "diagnostics")]
+        let isolated = std::env::var_os("VICTORY_DIAG_ISOLATED_INDIRECT").is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let isolated = false;
+        let signature_stride = if isolated {
+            match kind {
+                DRAW => 16,
+                INDEXED => 20,
+                DISPATCH | MESH => 12,
+                _ => return false,
+            }
+        } else { stride };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| host_signature(kind, signature_stride))
             .flatten()
         else {
             why("no host signature");
@@ -1038,10 +1050,23 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        }
+        let private = if isolated {
+            let count_gpu = counter.as_ref().map(|(s, at)| s.gpu(*at));
+            let Some(private) = crate::indirect::bound_isolated(
+                list, args.gpu(arguments), count_gpu, (kind, stride, max)
+            ) else {
+                why("isolated argument clamp unavailable or layout exceeds limit");
+                return false;
+            };
+            debug_assert_eq!(private.stride, signature_stride);
+            Some(private)
+        } else {
+            if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            }
+            None
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1057,7 +1082,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            if private.is_none() { crate::indirect::done(list, &args.buffer); }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1072,16 +1097,27 @@ impl State {
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some(private) = &private {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &private.buffer,
+                    0,
+                    count.map(|_| &private.buffer),
+                    if count.is_some() { private.count_offset } else { 0 },
+                );
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &args.buffer,
+                    args.offset(arguments),
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+            }
         };
-        crate::indirect::done(list, &args.buffer);
+        if private.is_none() { crate::indirect::done(list, &args.buffer); }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
