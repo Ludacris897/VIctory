@@ -218,7 +218,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    emit_with_wave_policy(c, native, p, st, io, res, false).map(|(shader, _, _)| shader)
+    emit_with_wave_policy(c, native, p, st, io, res, false, false).map(|(shader, _, _)| shader)
 }
 
 /// Offline wave-size experiment. The ordinary runtime emitter retains its
@@ -231,6 +231,7 @@ pub fn emit_with_wave_policy(
     io: &io::Io,
     res: &resource::Resources,
     small_wave32: bool,
+    cross_warp_lds: bool,
 ) -> Result<(HostShader, Option<u32>, bool), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -291,8 +292,8 @@ pub fn emit_with_wave_policy(
         prims,
         mesh_stride,
     };
-    let l = if small_wave32 {
-        lower::lower_with_wave_policy(&parts, true)?
+    let l = if small_wave32 || cross_warp_lds {
+        lower::lower_with_wave_policy(&parts, small_wave32, cross_warp_lds)?
     } else {
         lower::lower(&parts)?
     };
