@@ -701,10 +701,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // Texture construction or view creation failed. The
+                // caller supplies a null view and retries on next use.
+                once!(dimension = resource[0], "placed texture view unavailable");
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -720,11 +719,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
+/// A shader or unordered view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
@@ -732,7 +731,15 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    // SRVs and UAVs with the same backing description must use the
+    // same host texture. Do not invent writable flags on a read-only
+    // or depth allocation; make() still checks host compatibility.
+    let words = desc[..10].try_into().ok();
+    if *unordered {
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
