@@ -534,9 +534,26 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let status = WaitForSingleObject(self.event, INFINITE);
+                        if status.0 != 0 {
+                            fail(format_args!("host fence wait failed: {status:?}, group {i}, {} lists{}", runs.len(), self.removal_data(runs)));
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        let _ = self.log_messages();
+                        fail(format_args!("host submission signal/wait failed: {e}, group {i}, {} lists{}{}", runs.len(), self.removal_data(runs), last_notes(runs)));
+                    }
+                }
+                // A removed device can signal a fence without executing
+                // the list. Never submit later groups or read timestamps
+                // from an incomplete list.
+                if let Err(e) = self.device.GetDeviceRemovedReason() {
+                    let _ = self.log_messages();
+                    fail(format_args!(
+                        "host GPU device removed in group {i} of {} ({} title lists, elapsed {} ms): {e}{}{}",
+                        groups.len(), runs.len(), started.elapsed().as_millis(),
+                        self.removal_data(runs), last_notes(runs)
+                    ));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -544,7 +561,7 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                tracing::warn!(group = i, ms = started.elapsed().as_millis(), commands, "slow host list");
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
