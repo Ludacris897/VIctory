@@ -943,7 +943,7 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        const DRAW: u32 = 0;
+        #[cfg(feature = "diagnostics")] if std::env::var_os("VICTORY_DIAG_SKIP_INDIRECT").is_some() { crate::pipeline::note_why("diagnostic indirect isolation".into()); return false; } const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
