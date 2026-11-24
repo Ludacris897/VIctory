@@ -418,6 +418,10 @@ fn translate(
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(program) => {
+                if !targets.is_empty() {
+                    t.lines.push(format!("target layout {short} {:?}: {:?}", p.stage, p.layout));
+                    t.lines.push(format!("target used resources {short} {:?}: {:?}", p.stage, p.used));
+                }
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 let res = match resource::track(&program, &p.layout, p.stage) {
@@ -426,6 +430,11 @@ fn translate(
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
+                        if !targets.is_empty() {
+                            for inst in program.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.machine.offset == offset) {
+                                t.lines.push(format!("target resource failure {short} {offset:#x}: {} {:?}", inst.name(), inst.fields));
+                            }
+                        }
                         t.fail(format!("resources: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
@@ -503,10 +512,19 @@ fn translate(
                                 }
                             }
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
-                            }),
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            if !targets.is_empty() {
+                                for (b, block) in program.blocks.iter().enumerate() {
+                                    for (i, inst) in block.insts.iter().enumerate().filter(|(_, i)| i.machine.offset == offset) {
+                                        t.lines.push(format!("target emit failure {short} {offset:#x}: {} {:?}", inst.name(), inst.fields));
+                                        for descriptor in r.descriptors.iter().filter(|d| d.site == (b, i)) {
+                                            t.lines.push(format!("target descriptor {short} {offset:#x}: {:?}", descriptor));
+                                        }
+                                    }
+                                }
+                            }
+                            t.fail(format!("emit: {what}"), || format!("{} at {offset:#x}", label()));
+                        },
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }
