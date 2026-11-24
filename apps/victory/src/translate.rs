@@ -182,6 +182,8 @@ pub fn run(
     let started = std::time::Instant::now();
     let compute_only = std::env::var_os("VICTORY_TRANSLATE_COMPUTE_ONLY").is_some();
     let small_wave32 = std::env::var_os("VICTORY_TRANSLATE_SMALL_WAVE32").is_some();
+    let cross_warp_lds = std::env::var_os("VICTORY_TRANSLATE_CROSS_WARP_LDS").is_some();
+    anyhow::ensure!(!cross_warp_lds || compute_only, "cross-warp LDS experiment requires compute-only translation");
     anyhow::ensure!(!small_wave32 || compute_only, "small wave32 experiment requires compute-only translation");
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -208,7 +210,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines}, compute_only={compute_only}, small_wave32={small_wave32})");
+    eprintln!("translate: starting with {threads} workers (validate={validate}, pipelines={pipelines}, compute_only={compute_only}, small_wave32={small_wave32}, cross_warp_lds={cross_warp_lds})");
     let mut scanned = 0usize;
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -251,7 +253,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only, small_wave32);
+                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only, small_wave32, cross_warp_lds);
                             let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             if n % 256 == 0 || n == job_count {
                                 let seconds = file_started.elapsed().as_secs_f64();
@@ -366,6 +368,7 @@ fn translate(
     checks: &mut Checks,
     compute_only: bool,
     small_wave32: bool,
+    cross_warp_lds: bool,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -450,7 +453,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit_with_wave_policy(&container, &p, &program, &s, &i, &r, small_wave32) {
+                    match emit::emit_with_wave_policy(&container, &p, &program, &s, &i, &r, small_wave32, cross_warp_lds) {
                         Ok((shader, requested, console_lanes)) => {
                             *counter(t, p.stage, 1) += 1;
                             let before = t.cs_pipelines;
