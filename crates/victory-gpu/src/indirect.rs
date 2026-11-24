@@ -51,12 +51,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint from = id.x * stride;
 #ifdef ISOLATED
     uint at = id.x * out_stride;
+    // Counted calls must not reserve budget for records the GPU will
+    // never execute. The count lives in a separate scratch word.
+    uint active = records;
+    if (has_count != 0) {
+        active = min(source_count.Load(0), records);
+        if (id.x == 0) args.Store(count_offset, active);
+    }
+    if (id.x >= active) return;
     // Copy only the command fields, never the padding in a title record.
     if (kind == 0) args.Store2(at + 8, INPUT.Load2(from + 8));
     if (kind == 1) args.Store3(at + 8, INPUT.Load3(from + 8));
-    if (id.x == 0 && has_count != 0) {
-        args.Store(count_offset, min(source_count.Load(0), records));
-    }
 #else
     uint at = from;
 #endif
