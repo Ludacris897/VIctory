@@ -951,7 +951,7 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { #[cfg(feature = "diagnostics")] crate::pipeline::note_drop(self.pipeline as This); return false; }; let compatible = match kind { DRAW | INDEXED => !p.compute && !p.mesh && self.topology != RECTANGLES, DISPATCH => p.compute, MESH => !p.compute && p.mesh, _ => false }; if !compatible { why("incompatible pipeline before argument clamp"); return false; } let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
