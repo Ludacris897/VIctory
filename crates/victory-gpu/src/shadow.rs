@@ -714,7 +714,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_edges {
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
