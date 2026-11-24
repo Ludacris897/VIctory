@@ -180,6 +180,11 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
+    let targets: HashSet<String> = std::env::var("VICTORY_TRANSLATE_HASHES").unwrap_or_default()
+        .split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+    anyhow::ensure!(targets.iter().all(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+        "VICTORY_TRANSLATE_HASHES expects comma-separated 16-digit runtime hashes");
+    if !targets.is_empty() { eprintln!("targeted translation: {} runtime container hashes", targets.len()); }
     let compute_only = std::env::var_os("VICTORY_TRANSLATE_COMPUTE_ONLY").is_some();
     let small_wave32 = std::env::var_os("VICTORY_TRANSLATE_SMALL_WAVE32").is_some();
     let cross_warp_lds = std::env::var_os("VICTORY_TRANSLATE_CROSS_WARP_LDS").is_some();
@@ -240,7 +245,7 @@ pub fn run(
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         let mut t = Tally {
-                            list,
+                            list: list || !targets.is_empty(),
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -253,7 +258,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only, small_wave32, cross_warp_lds);
+                            translate(job, entry.path(), &seen, &mut t, &mut checks, compute_only, small_wave32, cross_warp_lds, &targets);
                             let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             if n % 256 == 0 || n == job_count {
                                 let seconds = file_started.elapsed().as_secs_f64();
@@ -348,6 +353,13 @@ pub fn run(
         }
     }
     let mut lines = t.lines;
+    if !targets.is_empty() {
+        let mut missing: Vec<_> = targets.iter().filter(|h| {
+            !lines.iter().any(|l| l.starts_with(&format!("target match: {h} ")))
+        }).collect();
+        missing.sort();
+        for h in missing { println!("target not found: {h}"); }
+    }
     lines.sort();
     for l in lines {
         println!("{l}");
@@ -369,11 +381,16 @@ fn translate(
     compute_only: bool,
     small_wave32: bool,
     cross_warp_lds: bool,
+    targets: &HashSet<String>,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail("corrupt record".into(), || format!("{}{}", path.display(), source.label()));
     };
+    let runtime_hash = blake3::hash(&bytes);
+    let hex = runtime_hash.to_hex();
+    let short = &hex[..16];
+    if !targets.is_empty() && !targets.contains(short) { return; }
+    let example = || format!("{}{} [hash={short}]", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -382,9 +399,12 @@ fn translate(
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     let identity = blake3::hash(dxil);
-    if !lock(seen).insert(identity) {
+    if !lock(seen).insert(if targets.is_empty() { identity } else { runtime_hash }) {
         t.duplicates += 1;
         return;
+    }
+    if !targets.is_empty() {
+        t.lines.push(format!("target match: {short} {}", example()));
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
