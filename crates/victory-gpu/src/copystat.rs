@@ -45,8 +45,12 @@ pub(crate) enum C {
     TextureUs,
     StepsUs,
     BottomUs,
+    /// Ranges shaders were declared to write, and their bytes (each
+    /// compared at copy-back).
+    BackRanges,
+    BackBytes,
 }
-const COUNTERS: usize = 27;
+const COUNTERS: usize = 29;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -137,12 +141,15 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "preparing per frame: steps {:.1} ms (flushing refreshes {:.1} ms, snapshots for shader \
-         writes {:.1} ms, textures {:.1} ms); bottom-of-pipe writes {:.2} ms",
+         writes {:.1} ms, textures {:.1} ms); bottom-of-pipe writes {:.2} ms; copy-back compared \
+         {:.0} ranges {:.1} MB",
         ms(c[C::StepsUs as usize]),
         ms(c[C::FlushUs as usize]),
         ms(c[C::GpuWriteUs as usize]),
         ms(c[C::TextureUs as usize]),
         ms(c[C::BottomUs as usize]),
+        c[C::BackRanges as usize],
+        mb(c[C::BackBytes as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
