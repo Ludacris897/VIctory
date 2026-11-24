@@ -727,7 +727,7 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res);
+            let shader = emit(&c, &native, &p, &st, &io, &res, Target::ANY);
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
                 assert!(

@@ -79,11 +79,6 @@ const fn buffer_store_dword_offen(vdata: u8, voff: u8, srsrc: u8) -> [u32; 2] {
     ]
 }
 
-/// VOP2 `op vdst, src0, vsrc1`.
-const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
-    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
-}
-
 /// VOPC `op vcc, src0, vsrc1`.
 const fn vopc(op: u8, src0: u16, vsrc1: u8) -> u32 {
     0x7C00_0000 | (op as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
@@ -99,14 +94,6 @@ const fn ds_bpermute_b32(vdst: u8, vaddr: u8, vdata0: u8, offset: u16) -> [u32; 
     [
         0xD800_0000 | (0x0B3 << 18) | offset as u32,
         (vdst as u32) << 24 | (vdata0 as u32) << 8 | vaddr as u32,
-    ]
-}
-
-/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen`.
-const fn buffer_store_dword_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
-    [
-        0x38 << 26 | 0x1C << 18 | 1 << 12,
-        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
     ]
 }
 
@@ -914,6 +901,9 @@ fn run_wave_cs(wave64: bool, body: &[u32], mut check: impl FnMut(&str, &[u32])) 
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
 

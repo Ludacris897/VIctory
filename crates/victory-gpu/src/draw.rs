@@ -569,6 +569,9 @@ impl State {
                 }
             }
         }
+        // Every buffer copy the stages read or write, each in the one state
+        // its uses allow together.
+        list.settle_buffers();
         true
     }
 
@@ -639,9 +642,6 @@ impl State {
             }
         }
         true
-        // Every buffer copy the stages read or write, each in the one state
-        // its uses allow together.
-        list.settle_buffers();
     }
 
     /// Runs a dispatch on the host.
@@ -710,7 +710,7 @@ impl State {
         let targets: Vec<String> = if compute {
             Vec::new()
         } else {
-            self.targets.iter().map(|t| format!("{t:#x}")).collect()
+            self.targets.iter().map(|t| format!("{:#x}", t.0)).collect()
         };
         let outcome = if ran {
             "ran".to_owned()

@@ -8579,6 +8579,9 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: super::super::Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
             })
             .unwrap();
             #[cfg(windows)]
@@ -8749,6 +8752,9 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: super::super::Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
             })
             .unwrap();
             validate(&l.dxil);
@@ -8793,6 +8799,9 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .err()
         .unwrap();
@@ -8858,6 +8867,9 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         validate(&l.dxil);

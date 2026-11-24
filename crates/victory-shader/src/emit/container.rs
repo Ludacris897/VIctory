@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(over, MESH_OUTPUT_LIMIT + 4 * 2 * 32);
     }
 
-    fn element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
+    fn interp_element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -492,12 +492,12 @@ mod tests {
     #[test]
     fn rows_of_mixed_interpolation_are_separated() {
         let mut e = vec![
-            element("A", 0, 0, 2),
-            element("B", 0, 1, 1),
-            element("C", 1, 0, 2),
-            element("D", 0, 2, 1),
-            element("E", 0, 3, 2),
-            element("F", 1, 1, 0),
+            interp_element("A", 0, 0, 2),
+            interp_element("B", 0, 1, 1),
+            interp_element("C", 1, 0, 2),
+            interp_element("D", 0, 2, 1),
+            interp_element("E", 0, 3, 2),
+            interp_element("F", 1, 1, 0),
         ];
         separate_interpolation(&mut e);
         let rows: Vec<u32> = e.iter().map(|e| e.row.unwrap()).collect();
