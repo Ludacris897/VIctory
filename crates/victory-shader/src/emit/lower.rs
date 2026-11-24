@@ -4015,7 +4015,9 @@ impl<'a> Lower<'a> {
                 // A buffer the program also reads through s_buffer_load (a
                 // constant buffer it measures or indexes by hand): a raw
                 // buffer view describes it.
-                Fields::Smem { .. } if un.starts_with("s_buffer_load") => ((11, 0), None),
+                Fields::Smem { .. } if un.starts_with("s_buffer_load") && super::trial("sbuf") => {
+                    ((11, 0), None)
+                }
                 _ => return Err("a scalar memory read as data"),
             };
             (first, src, props, image, uav)
@@ -4580,6 +4582,9 @@ impl<'a> Lower<'a> {
         };
         if let Some(e) = key.and_then(|k| self.entries.get(&k)) {
             return Ok(*e);
+        }
+        if !super::trial("stride") {
+            return Err("a structured buffer of unknown stride");
         }
         let slot = self
             .heap_slot(src, false)
@@ -7215,8 +7220,8 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
-            | "image_gather4_l_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4_l" | "image_gather4_l_o" if super::trial("gather4l") => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),

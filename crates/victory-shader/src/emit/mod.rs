@@ -123,18 +123,41 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
-/// Whether the console-flow fallback for lane masks read as data (see
-/// [`CONSOLE_FLOW_FALLBACK`]) is on: `VICTORY_CONSOLE_FALLBACK=1`. Off by
-/// default: on the first run with it the scene went black right after
-/// one such translation was first used.
-pub fn console_fallback() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("VICTORY_CONSOLE_FALLBACK").ok().as_deref(),
-            Some("1" | "on" | "true")
-        )
+/// The translation changes still on trial, each off unless named in
+/// `VICTORY_TRIALS` (comma-separated, or `all`): `console` (the
+/// console-flow fallback for lane masks read as data, see
+/// [`CONSOLE_FLOW_FALLBACK`]), `stride` (structured reads of unknown
+/// stride through the runtime stride table, upstream #704), `gather4l`
+/// (`image_gather4_l` as a plain gather, upstream #694) and `sbuf` (a
+/// buffer descriptor read as data whose other use is `s_buffer_load`).
+/// With all four the scene went black in game; off, those shaders are
+/// dropped as before.
+pub const TRIALS: [&str; 4] = ["console", "stride", "gather4l", "sbuf"];
+
+/// The value of `VICTORY_TRIALS` as the translation reads it (part of
+/// the shader cache key).
+pub fn trials() -> &'static str {
+    static ON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRIALS").unwrap_or_default();
+        let mut on: Vec<&str> = TRIALS
+            .into_iter()
+            .filter(|t| v == "all" || v.split(',').any(|x| x.trim() == *t))
+            .collect();
+        on.sort_unstable();
+        on.join(",")
     })
+}
+
+/// Whether trial `name` (one of [`TRIALS`]) is on.
+pub fn trial(name: &str) -> bool {
+    // (The unit tests test every trial.)
+    cfg!(test) || trials().split(',').any(|t| t == name)
+}
+
+/// The console-flow fallback trial.
+pub fn console_fallback() -> bool {
+    trial("console")
 }
 
 thread_local! {

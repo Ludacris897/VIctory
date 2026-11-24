@@ -147,7 +147,7 @@ impl Shader {
                     tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
-                        "shader translated through console flow (VICTORY_CONSOLE_FALLBACK)"
+                        "shader translated through console flow (trial console)"
                     );
                 }
                 match &done {
