@@ -180,6 +180,33 @@ impl GraphicsState {
         }
     }
 
+    /// The blend state as the host takes it: no blending on a
+    /// target of an integer format, which D3D12 refuses the whole pipeline
+    /// for ("this format does not support blending"); the console ignores
+    /// blending there and writes the shader's value.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut b = self.blend;
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |f: DXGI_FORMAT| {
+            matches!(f.0, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64)
+        };
+        let slots: Vec<usize> = (0..n).filter(|&i| integer(self.targets.RTFormats[i])).collect();
+        let first = b.RenderTarget[0];
+        let blends = |t: &D3D12_RENDER_TARGET_BLEND_DESC| t.BlendEnable.as_bool();
+        let index = |i: usize| if b.IndependentBlendEnable.as_bool() { i } else { 0 };
+        if !slots.iter().any(|&i| blends(&b.RenderTarget[index(i)])) {
+            return b;
+        }
+        if !b.IndependentBlendEnable.as_bool() {
+            b.RenderTarget = [first; 8];
+            b.IndependentBlendEnable = true.into();
+        }
+        for i in slots {
+            b.RenderTarget[i].BlendEnable = false.into();
+        }
+        b
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -605,7 +632,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -761,7 +788,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
