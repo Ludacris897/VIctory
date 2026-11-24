@@ -24,8 +24,19 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
+#ifdef ISOLATED
+#define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+cbuffer Record : register(b0) {
+    uint kind; uint stride; uint records; uint out_stride; uint count_offset; uint has_count;
+};
+RWByteAddressBuffer source_args : register(u2);
+RWByteAddressBuffer source_count : register(u3);
+#define INPUT source_args
+#else
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define INPUT args
+#endif
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -37,16 +48,27 @@ static const uint GROUPS = 1u << 20;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
-    uint at = id.x * stride;
+    uint from = id.x * stride;
+#ifdef ISOLATED
+    uint at = id.x * out_stride;
+    // Copy only the command fields, never the padding in a title record.
+    if (kind == 0) args.Store2(at + 8, INPUT.Load2(from + 8));
+    if (kind == 1) args.Store3(at + 8, INPUT.Load3(from + 8));
+    if (id.x == 0 && has_count != 0) {
+        args.Store(count_offset, min(source_count.Load(0), records));
+    }
+#else
+    uint at = from;
+#endif
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(INPUT.Load(from), 1u << 24);
+        uint instances = min(INPUT.Load(from + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = min(INPUT.Load3(from), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -55,7 +77,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         args.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
+        uint3 g = INPUT.Load3(from);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
@@ -104,14 +126,19 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
+    make_variant(false)
+}
+
+fn make_variant(isolated: bool) -> windows::core::Result<Clamp> {
+    let source = if isolated { format!("#define ISOLATED 1\n{SOURCE}") } else { SOURCE.to_owned() };
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -160,15 +187,92 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
+fn isolated_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP.get_or_init(|| match make_variant(true) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "isolated argument clamp unavailable");
+            None
+        }
+    }).as_ref()
+}
+
+fn command_size(kind: u32) -> Option<u32> {
+    match kind {
+        0 => Some(16),
+        1 => Some(20),
+        2 | 10 => Some(12),
+        _ => None,
+    }
+}
+
+/// Compact scratch records followed by a separate, optional count word.
+/// The limit bounds temporary allocation per indirect call.
+fn scratch_layout(kind: u32, stride: u32, records: u32) -> Option<(u32, u32, u64)> {
+    if !valid_layout(kind, stride, records) { return None; }
+    let size = command_size(kind)?;
+    let count_offset = size.checked_mul(records)?;
+    let bytes = u64::from(count_offset) + 4;
+    (bytes <= 16 * 1024 * 1024).then_some((size, count_offset, bytes))
+}
+
+/// A private argument allocation. The source buffers are read by the
+/// clamp as UAVs as before, but never mutated or transitioned to INDIRECT.
+pub(crate) struct IsolatedArgs {
+    pub buffer: ID3D12Resource,
+    pub stride: u32,
+    pub count_offset: u64,
+    #[cfg(test)]
+    data: *mut u8,
+}
+
+/// GPU-side copy and clamp, retaining the original arguments and count.
+/// The caller retains source allocations; this list retains the result.
+/// The scratch buffer is used for exactly one ExecuteIndirect.
+pub(crate) fn bound_isolated(
+    list: &HostList,
+    source_gpu: u64,
+    count_gpu: Option<u64>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<IsolatedArgs> {
+    let (out_stride, count_offset, bytes) = scratch_layout(kind, stride, records)?;
+    if !source_gpu.is_multiple_of(4) || count_gpu.is_some_and(|g| !g.is_multiple_of(4)) {
+        return None;
+    }
+    let c = isolated_clamp()?;
+    let budget = list.budget()?;
+    let (buffer, data) = host()?.shared_buffer(bytes)?;
+    list.keep(&buffer);
+    let constants = [kind, stride, records, out_stride, count_offset, u32::from(count_gpu.is_some())];
+    let l = &list.list;
+    unsafe {
+        l.ResourceBarrier(&[uav_barrier()]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, buffer.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, source_gpu);
+        l.SetComputeRootUnorderedAccessView(4, count_gpu.unwrap_or(source_gpu));
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ]);
+    }
+    let _ = data;
+    Some(IsolatedArgs {
+        buffer, stride: out_stride, count_offset: u64::from(count_offset),
+        #[cfg(test)]
+        data,
+    })
+}
+
 /// Reject layouts that cannot be addressed by the clamp's uint byte offsets
 /// or exceed D3D12's one-dimensional dispatch limit.
 fn valid_layout(kind: u32, stride: u32, records: u32) -> bool {
-    let minimum = match kind {
-        0 => 16, // D3D12_DRAW_ARGUMENTS
-        1 => 20, // D3D12_DRAW_INDEXED_ARGUMENTS
-        2 | 10 => 12, // dispatch / mesh
-        _ => return false,
-    };
+    let Some(minimum) = command_size(kind) else { return false; };
     records != 0
         && stride >= minimum
         && stride.is_multiple_of(4)
@@ -256,6 +360,62 @@ mod tests {
         assert!(!super::valid_layout(2, 12, 65_535 * 64 + 1));
         assert!(!super::valid_layout(2, 0xffff_fffc, 2));
         assert!(!super::valid_layout(3, 16, 1));
+    }
+
+    #[test]
+    fn isolated_layout_is_compact_and_bounded() {
+        assert_eq!(super::scratch_layout(1, 32, 3), Some((20, 60, 64)));
+        assert_eq!(super::scratch_layout(2, 16, 8), Some((12, 96, 100)));
+        assert!(super::scratch_layout(0, 16, 2_000_000).is_none());
+        assert!(super::scratch_layout(1, 16, 1).is_none());
+    }
+
+    #[test]
+    fn isolated_clamp_preserves_source_and_copies_count_on_gpu() {
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU; isolated execution test skipped");
+            return;
+        };
+        let list = host.new_list().expect("isolated test list");
+        let (source, data) = host.shared_buffer(8 * 32 + 4).expect("isolated source");
+        unsafe {
+            for i in 0..8 {
+                let record = data.cast::<u32>().add(i * 8);
+                record.write(1 << 24);
+                record.add(1).write(4);
+                record.add(2).write(17);
+                record.add(3).write(23);
+                for j in 4..8 { record.add(j).write(0xfeedbeef); }
+            }
+            data.cast::<u32>().add(64).write(99);
+        }
+        let gpu = unsafe { source.GetGPUVirtualAddress() };
+        let result = super::bound_isolated(&list, gpu, Some(gpu + 256), (0, 32, 8))
+            .expect("isolated clamp records");
+        assert_eq!(result.stride, 16);
+        assert_eq!(result.count_offset, 128);
+        list.close();
+        host.execute(&[&list]);
+        let mut accepted = 0;
+        unsafe {
+            for i in 0..8 {
+                let original = data.cast::<u32>().add(i * 8);
+                assert_eq!(original.read_volatile(), 1 << 24);
+                assert_eq!(original.add(1).read_volatile(), 4);
+                assert_eq!(original.add(4).read_volatile(), 0xfeedbeef);
+                let record = result.data.cast::<u32>().add(i * 4);
+                let count = record.read_volatile();
+                assert!(count == 0 || count == 1 << 24);
+                accepted += usize::from(count != 0);
+                assert_eq!(record.add(1).read_volatile(), 4);
+                assert_eq!(record.add(2).read_volatile(), 17);
+                assert_eq!(record.add(3).read_volatile(), 23);
+            }
+            assert_eq!(data.cast::<u32>().add(64).read_volatile(), 99);
+            assert_eq!(result.data.cast::<u32>().add(32).read_volatile(), 8);
+        }
+        assert_eq!(accepted, 2);
+        eprintln!("isolated GPU clamp: 2/8 accepted; source unchanged; count clamped to 8");
     }
 
     /// Execute only the clamp (never the clamped draw arguments). Check
