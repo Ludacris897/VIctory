@@ -209,3 +209,12 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     );
     Ok(all)
 }
+
+#[cfg(windows)]
+#[used]
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 614;
+#[cfg(windows)]
+#[used]
+#[unsafe(no_mangle)]
+pub static mut D3D12SDKPath: *const std::ffi::c_char = c".\\D3D12\\".as_ptr();

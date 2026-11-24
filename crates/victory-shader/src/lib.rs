@@ -34,3 +34,12 @@ pub enum ShaderError {
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
 }
+
+#[cfg(all(test, windows))]
+#[used]
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 614;
+#[cfg(all(test, windows))]
+#[used]
+#[unsafe(no_mangle)]
+pub static mut D3D12SDKPath: *const std::ffi::c_char = c".\\D3D12\\".as_ptr();
