@@ -1011,7 +1011,27 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { #[cfg(feature = "diagnostics")] crate::pipeline::note_drop(self.pipeline as This); return false; }; let compatible = match kind { DRAW | INDEXED => !p.compute && !p.mesh && self.topology != RECTANGLES, DISPATCH => p.compute, MESH => !p.compute && p.mesh, _ => false }; if !compatible { why("incompatible pipeline before argument clamp"); return false; } let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        };
+        let incompatible = match kind {
+            DRAW | INDEXED if p.compute => Some("graphics arguments with compute pipeline"),
+            DRAW | INDEXED if p.mesh => Some("graphics arguments with mesh pipeline"),
+            DRAW | INDEXED if self.topology == RECTANGLES => Some("rectangle topology requires indirect expansion"),
+            DISPATCH if !p.compute => Some("compute arguments with graphics pipeline"),
+            MESH if p.compute || !p.mesh => Some("mesh arguments with non-mesh pipeline"),
+            DRAW | INDEXED | DISPATCH | MESH => None,
+            _ => Some("unknown indirect argument kind"),
+        };
+        if let Some(reason) = incompatible {
+            why(reason);
+            #[cfg(feature = "diagnostics")]
+            once!(kind, topology = self.topology, compute = p.compute, mesh = p.mesh, reason, "indirect preflight refused");
+            return false;
+        }
+        let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -1227,7 +1247,16 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(v @ View::Unordered(r, ..)) => {
+            if let Some(t) = texture(*r as This) {
+                format!("uav texture {t}")
+            } else if let Some((address, len)) = crate::descriptor::host::buffer_range(v) {
+                let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+                format!("uav buffer {address:#x}+{len:#x} host {host:#x?}")
+            } else {
+                "uav without a resolved buffer range or texture".into()
+            }
+        },
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
