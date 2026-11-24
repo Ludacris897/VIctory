@@ -341,12 +341,13 @@ impl HostHeap {
         };
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
             } else {
                 make(&view, self.cpu(index))
             };
+            // Failed mirroring may be transient: retry on the next use.
+            made[index as usize] = if kept.is_some() { key } else { 0 };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -446,10 +447,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -464,10 +462,15 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
+}
+
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    if element == 0 { return None; }
+    let address = base.checked_add(first.checked_mul(element)?)?;
+    let len = u64::from(count).checked_mul(element)?;
+    address.checked_add(len)?;
+    Some((address, len))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -492,7 +495,9 @@ fn buffer_srv(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if buffer.FirstElement.checked_add(u64::from(buffer.NumElements))?.checked_mul(element)? > width { return None; }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -534,7 +539,9 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if buffer.FirstElement.checked_add(u64::from(buffer.NumElements))?.checked_mul(element)? > width { return None; }
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -855,6 +862,15 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_ranges_reject_invalid_arithmetic() {
+        assert_eq!(checked_buffer_range(100, 2, 3, 4), Some((108, 12)));
+        assert_eq!(checked_buffer_range(100, 0, 1, 0), None);
+        assert_eq!(checked_buffer_range(u64::MAX, 1, 1, 4), None);
+        assert_eq!(checked_buffer_range(0, u64::MAX, 1, 4), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 3, 0, 2, 4), None);
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
