@@ -167,7 +167,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -431,6 +431,21 @@ fn biased_sample_address(k: usize, a16: bool) -> (usize, Option<u32>) {
     if !a16 || k == 0 { return (k, None); }
     let coord = k - 1;
     (1 + coord / 2, Some(16 * (coord as u32 % 2)))
+}
+
+/// A16 gradient directions each begin at a new dword; coordinates and
+/// the optional minimum LOD form a third independently packed segment.
+fn gradient_sample_address(k: usize, spatial: usize, a16: bool) -> (usize, Option<u32>) {
+    if !a16 { return (k, None); }
+    let words = spatial.div_ceil(2);
+    let (base, component) = if k < spatial {
+        (0, k)
+    } else if k < 2 * spatial {
+        (words, k - spatial)
+    } else {
+        (2 * words, k - 2 * spatial)
+    };
+    (base + component / 2, Some(16 * (component as u32 % 2)))
 }
 
 impl<'a> Lower<'a> {
@@ -3358,7 +3373,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5421,6 +5436,9 @@ impl<'a> Lower<'a> {
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
             let (word, half) = if name == "image_sample_b" {
                 biased_sample_address(k, *a16)
+            } else if matches!(name, "image_sample_d" | "image_sample_d_cl") {
+                let spatial = coords - usize::from(kind == 6 || kind == 7);
+                gradient_sample_address(k, spatial, *a16)
             } else if *a16 {
                 (k / 2, Some(16 * (k as u32 % 2)))
             } else {
@@ -5579,7 +5597,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -5749,7 +5767,13 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    let clamp = if name == "image_sample_d_cl" {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -6773,6 +6797,22 @@ mod tests {
         assert_eq!(addr(3, true), (2, Some(0)));
         assert_eq!(addr(4, true), (2, Some(16)));
         for k in 0..5 { assert_eq!(addr(k, false), (k, None)); }
+    }
+
+    #[test]
+    fn gradient_sample_separates_packed_directions_and_clamp() {
+        use super::gradient_sample_address as addr;
+        // 1D: X derivative, Y derivative, then coordinate and clamp.
+        assert_eq!((0..4).map(|k| addr(k, 1, true)).collect::<Vec<_>>(),
+            vec![(0, Some(0)), (1, Some(0)), (2, Some(0)), (2, Some(16))]);
+        // 2D: each direction occupies one word; clamp follows XY.
+        assert_eq!(addr(4, 2, true), (2, Some(0)));
+        assert_eq!(addr(6, 2, true), (3, Some(0)));
+        // 3D: each direction occupies two words, including padding.
+        assert_eq!(addr(3, 3, true), (2, Some(0)));
+        assert_eq!(addr(6, 3, true), (4, Some(0)));
+        assert_eq!(addr(9, 3, true), (5, Some(16)));
+        for k in 0..10 { assert_eq!(addr(k, 3, false), (k, None)); }
     }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
