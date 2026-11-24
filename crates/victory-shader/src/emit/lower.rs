@@ -31,6 +31,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    pub requested_wave_size: Option<u32>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -59,9 +60,13 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_wave_policy(parts, false)
+}
+
+pub(crate) fn lower_with_wave_policy(parts: &Parts, small_wave32: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, small_wave32).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -323,8 +328,23 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Offline experiment: a small LDS workgroup with no detected explicit
+/// lane dependencies still occupies one wave if it is run as wave32.
+fn required_wave(wave: u32, threads: u32, lds: u32, console_lanes: bool, small_wave32: bool) -> Option<u32> {
+    if console_lanes {
+        return Some(wave);
+    }
+    if threads <= wave && lds > 0 {
+        if small_wave32 && wave == 64 && (1..=32).contains(&threads) {
+            return Some(32);
+        }
+        return Some(wave);
+    }
+    None
+}
+
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, small_wave32: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -380,10 +400,10 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
-            }
+            s.wave_size = required_wave(
+                wave, cs.threads.iter().product::<u32>(), s.lds_dwords,
+                console_lanes, small_wave32,
+            );
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -884,6 +904,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            requested_wave_size: self.s.wave_size,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -6562,6 +6583,21 @@ mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
+
+    #[test]
+    fn small_wave32_policy_is_conservative() {
+        use super::required_wave;
+        assert_eq!(required_wave(64, 32, 16, false, false), Some(64));
+        assert_eq!(required_wave(64, 32, 16, false, true), Some(32));
+        assert_eq!(required_wave(64, 16, 16, false, true), Some(32));
+        assert_eq!(required_wave(64, 33, 16, false, true), Some(64));
+        assert_eq!(required_wave(64, 64, 16, false, true), Some(64));
+        assert_eq!(required_wave(64, 32, 16, true, true), Some(64));
+        assert_eq!(required_wave(64, 128, 16, false, true), None);
+        assert_eq!(required_wave(64, 32, 0, false, true), None);
+        assert_eq!(required_wave(32, 32, 16, false, true), Some(32));
+        assert_eq!(required_wave(64, 0, 16, false, true), Some(64));
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
