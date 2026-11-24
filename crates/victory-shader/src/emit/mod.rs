@@ -461,6 +461,20 @@ pub fn emit(
                 }
             }
         }
+        // `VICTORY_WAVE_WIDE=last`: the wave-wide form above only for a program every other
+        // form left at 64 lanes, which this host refuses outright (the intro video's
+        // programs among them on an RTX 3090) — not for the programs that had a form.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        if wide_last {
+            let bases = [forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+            for base in bases.into_iter().flatten() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
