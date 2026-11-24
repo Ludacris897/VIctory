@@ -1677,8 +1677,15 @@ mod reservation_tests {
         let retained = weak.upgrade().expect("recording retains original heap");
         drop(state);
         assert_eq!(Arc::strong_count(&retained), 1);
-        // The replacement heap's first slot remains occupied.
-        assert_ne!(new.dynamic(1).unwrap(), b);
+        // On diagnostics builds check both allocator bitmaps, not just
+        // their next-fit cursors: old is released, new is still reserved.
+        #[cfg(feature = "diagnostics")]
+        {
+            let (capacity, free, _) = retained.dynamic_stats().unwrap();
+            assert_eq!(free, capacity);
+            let (capacity, free, _) = new.dynamic_stats().unwrap();
+            assert_eq!(free, capacity - 1);
+        }
         // Both heaps have the same numeric slot indices but distinct owners.
         assert_ne!(retained.heap.as_raw(), new.heap.as_raw());
     }
