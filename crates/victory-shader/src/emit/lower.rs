@@ -929,6 +929,27 @@ fn lds_race() -> bool {
     LDS_RACE.get()
 }
 
+thread_local! {
+    /// See [`with_split`].
+    static SPLIT: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+/// Runs `f` for a compute program whose console thread group of `k` console waves is run as
+/// `k` host groups of one console wave each, stacked along y (`super::widen`): the host's
+/// group id y is the console's times `k` plus the wave, and the host group's thread y is the
+/// console's less the wave's first row. The console's ids are rebuilt from the host's
+/// ([`Lower::thread_id`], the group id input), so the program sees its own.
+pub(super) fn with_split<R>(k: u32, f: impl FnOnce() -> R) -> R {
+    let was = SPLIT.replace(k);
+    let r = f();
+    SPLIT.set(was);
+    r
+}
+
+fn split() -> u32 {
+    SPLIT.get()
+}
+
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -2328,6 +2349,14 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(1) if split() > 1 => {
+                // (`with_split`: the console group's y is the host's over the waves per group)
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 1) else {
+                    unreachable!()
+                };
+                let k = self.s.m.i32(split());
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::UDiv, g, k));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -4083,6 +4112,25 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
+        let v = self.host_thread_id(c);
+        if c != 1 || split() <= 1 {
+            return v;
+        }
+        // (`with_split`: the console group's thread y is the host's plus the rows of the
+        // console waves before this one, the host group id y's remainder by the waves)
+        let Val::I32(t) = v else { return v };
+        let Val::I32(g) = self.compute_id("groupId.i32", 94, 1) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        let k = self.s.m.i32(split());
+        let rows = self.s.m.i32(self.s.threads.expect("compute")[1]);
+        let w = self.s.m.bin(e, Bin::URem, g, k);
+        let first = self.s.m.bin(e, Bin::Mul, w, rows);
+        Val::I32(self.s.m.bin(e, Bin::Add, first, t))
+    }
+
+    fn host_thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }

@@ -75,6 +75,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        // A console group run as several host groups along y (bits 8 up of has_count).
+        uint split = max(has_count >> 8, 1u);
+        g.y = min(g.y * split, 65535u);
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -249,10 +252,11 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    split_y: u32,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, split_y).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -272,7 +276,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, 1).then_some(dst)
 }
 
 fn record_clamp(
@@ -284,7 +288,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, 1)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -299,6 +303,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    split_y: u32,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -343,7 +348,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | (split_y.clamp(1, 0xFF_FFFF) << 8), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -1198,9 +1203,9 @@ void main() {
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), 1).unwrap();
         done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), 1).unwrap();
         done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
@@ -1210,7 +1215,7 @@ void main() {
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), 1).unwrap();
         done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
@@ -1224,7 +1229,7 @@ void main() {
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), 1).unwrap();
         done(&list, &b4);
         assert_eq!(
             b4.as_raw(),

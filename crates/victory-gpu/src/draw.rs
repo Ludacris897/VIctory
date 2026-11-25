@@ -2042,6 +2042,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // A console group run as several host groups along y (`HostPipeline::split_y`).
+        let y = y.saturating_mul(p.split_y()).min(65535);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2977,7 +2979,7 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), if kind == DISPATCH { p.split_y() } else { 1 })
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
