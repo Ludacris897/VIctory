@@ -627,10 +627,42 @@ fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
             }
         }
     }
+    // Whole-wave stretches: `s_or_saveexec sN, -1` turns every lane on for a wave reduction
+    // (inactive lanes give the identity through the saved mask) until EXEC is restored from a
+    // saved mask. Walked with EXEC clear that restore clears it again; between them only
+    // register work is allowed (VALU, scalar ALU), nothing a reactivated lane could make
+    // observable (no memory, LDS or export).
+    let all_on = |op: &Operand| matches!(op, Operand::Const(193) | Operand::Literal(u32::MAX));
     for &b in region {
+        let mut whole = false;
         for inst in &p.blocks[b].insts {
             let name = inst.name();
+            if whole && !matches!(inst.fields, Fields::Valu(_) | Fields::Sop { .. } | Fields::Sopp { .. }) {
+                return false;
+            }
             if !inst.writes.iter().any(|(reg, _)| matches!(reg, Reg::S(126 | 127))) {
+                continue;
+            }
+            if let Fields::Sop { src, .. } = &inst.fields
+                && !whole
+                && matches!(name, "s_or_saveexec_b32" | "s_or_saveexec_b64")
+                && src.first().is_some_and(all_on)
+            {
+                whole = true;
+                continue;
+            }
+            if whole {
+                // only a restore from a saved (empty) mask ends the stretch
+                let restore = matches!(name, "s_mov_b32" | "s_mov_b64")
+                    && matches!(&inst.fields, Fields::Sop { src, .. } if src.first().is_some_and(|op| match op {
+                        Operand::Scalar { code, dwords } => (0..*dwords).all(|i|
+                            inst.read(Reg::S(code + i)).is_some_and(|v| saved.contains(&v))),
+                        _ => false,
+                    }));
+                if !restore {
+                    return false;
+                }
+                whole = false;
                 continue;
             }
             if name.starts_with("v_cmpx_") || matches!(name, "s_and_saveexec_b32" | "s_and_saveexec_b64") {
@@ -654,6 +686,9 @@ fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
             if !stays_empty {
                 return false;
             }
+        }
+        if whole {
+            return false; // (a stretch that leaves its block)
         }
     }
     true
@@ -1688,6 +1723,31 @@ mod tests {
         // the skip, even though it saves the (empty) current EXEC.
         let activates = skip(&[0xBE90_250C, STORE[0], STORE[1]], &[]);
         assert!(without_skips(&activates, true).is_none());
+    }
+
+    #[test]
+    fn an_early_out_around_a_whole_wave_reduction_can_go() {
+        // `if (v0 < s0) { s_or_saveexec s[4:5], -1; <VALU>; exec = s[4:5] } end`: walked with
+        // EXEC clear the whole-wave stretch turns lanes on only for register work and its
+        // restore clears EXEC again, so the early-out can be left out.
+        const WHOLE: u32 = 0xBE84_25C1; // s_or_saveexec_b64 s[4:5], -1
+        const VALU: u32 = 0x7E02_0206; // v_mov_b32 v1, s6
+        const BACK: u32 = 0xBEFE_0404; // s_mov_b64 exec, s[4:5]
+        const STORE: [u32; 2] = [0xD834_0000, 0x0000_0C00]; // ds_write_b32 v0, v12
+        let early = |body: &[u32]| {
+            let mut w = vec![0x7D88_0000, 0xBE8C_246A, 0xBF88_0000 | body.len() as u32];
+            w.extend_from_slice(body);
+            w.push(S_ENDPGM);
+            build_words(&w, true)
+        };
+        let ok = early(&[WHOLE, VALU, BACK]);
+        assert_eq!(skips(&without_early_outs(&ok).expect("left out")), 0);
+        // a store after the restore stays masked
+        let after = early(&[WHOLE, VALU, BACK, STORE[0], STORE[1]]);
+        assert_eq!(skips(&without_early_outs(&after).expect("left out")), 0);
+        // not with memory work while every lane is on, nor without the restore
+        assert!(without_early_outs(&early(&[WHOLE, STORE[0], STORE[1], BACK])).is_none());
+        assert!(without_early_outs(&early(&[WHOLE, VALU])).is_none());
     }
 
     #[test]
