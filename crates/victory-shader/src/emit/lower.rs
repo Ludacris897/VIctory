@@ -5981,11 +5981,32 @@ impl<'a> Lower<'a> {
                 if count <= 4
                     && let Some((lo, hi)) = self.view_address(site)
                 {
+                    // Its record count too: a raw view's bytes. Some programs test it for
+                    // zero (a buffer that is not there) before any work; a null view has no
+                    // bytes, as a console descriptor has no records.
+                    let records = if count >= 3 {
+                        let src = Source::Loaded {
+                            load: site,
+                            first: 0,
+                        };
+                        let h = self.handle(site, &src, false, (11, 0))?;
+                        let c = self.cur;
+                        let i32t = self.s.t.i32;
+                        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                        let mip = self.s.m.undef(i32t);
+                        let d = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        Some(self.s.m.extract(c, d, 0))
+                    } else {
+                        None
+                    };
                     for k in 0..count {
                         let reg = Reg::S(code + k as u8);
                         match k {
                             0 => self.write(inst, reg, lo, None),
                             1 => self.write(inst, reg, hi, None),
+                            2 if let Some(n) = records => self.write(inst, reg, n, None),
                             _ => {
                                 if let Some(v) = inst.write(reg) {
                                     self.vals.insert(v, Val::Missing(OTHER));
