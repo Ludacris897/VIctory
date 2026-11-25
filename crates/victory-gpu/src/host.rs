@@ -2491,7 +2491,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2509,7 +2509,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2609,6 +2609,35 @@ mod fill_ahead {
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
     }
 
+    /// Whether a miss makes only fills of its 64 KiB pieces wait
+    /// (`VICTORY_FILL_WAIT_PIECES=1`), not every fill from then on. In
+    /// a world run one miss (2 KiB of a small buffer the shaders update,
+    /// frame 2116) sent some 1,600 fills a frame back to waiting, two
+    /// settles and some 44 ms a frame; the 3,050 of them checked after
+    /// their wait read the same bytes. A first miss in another piece is
+    /// bounded as the first miss is now: one submission draws with the
+    /// bytes from before, and its piece waits from then on.
+    fn pieces() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT_PIECES").is_some_and(|v| v == "1"))
+    }
+
+    /// Pieces a miss was found in (with [`pieces`]): fills of them wait.
+    static HOT: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+    /// Whether a fill or copy reading `len` bytes at `src` may go ahead of
+    /// flights that may write them.
+    pub(super) fn ahead(src: usize, len: usize) -> bool {
+        if !on() {
+            return false;
+        }
+        if !pieces() || len == 0 {
+            return true;
+        }
+        let hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+        hot.as_ref().is_none_or(|h| !(src / PIECE..=(src + len - 1) / PIECE).any(|p| h.contains(&p)))
+    }
+
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them.
     pub(super) fn read(src: usize, len: usize) {
@@ -2664,6 +2693,26 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if pieces() {
+                // Only this piece's fills wait from here on.
+                let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+                let set = hot.get_or_insert_with(Default::default);
+                let mut new_piece = false;
+                for p in from / PIECE..=(to - 1) / PIECE {
+                    new_piece |= set.insert(p);
+                }
+                if new_piece {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes \
+                         from before. Fills of its 64 KiB wait for flights from here on ({n} such fills; {} pieces wait)",
+                        to - from,
+                        a + first,
+                        set.len()
+                    );
+                }
+                return;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
