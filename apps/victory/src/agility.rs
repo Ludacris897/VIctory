@@ -11,8 +11,11 @@
 
 #![allow(non_upper_case_globals)] // the names the D3D12 loader looks up
 
-/// The Agility SDK version this executable asks for.
-pub const SDK_VERSION: u32 = 620;
+/// The Agility SDK version this executable asks for: 614, the release whose
+/// `D3D12Core.dll` this build is run with (`D3D12\` beside the executable).
+/// `cargo xtask agility` installs 1.620.2, which also serves a request for
+/// 614 (a runtime serves its own version and older ones).
+pub const SDK_VERSION: u32 = 614;
 
 #[unsafe(no_mangle)]
 #[used]
