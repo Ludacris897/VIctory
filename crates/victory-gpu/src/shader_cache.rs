@@ -74,6 +74,7 @@ fn build() -> &'static [u8; 32] {
             Ok(translator) => {
                 let switches = [
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_LDS_RACE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
@@ -543,12 +544,19 @@ mod tests {
         assert!(victory_shader::SOURCE_HASH.bytes().all(|b| b.is_ascii_hexdigit()));
         // and, unless the executable is asked for, the key is made of it
         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_none() {
+            let _ = build();
             let expected = key(
-                &[&CACHE_SCHEMA_VERSION.to_le_bytes()[..], victory_shader::SOURCE_HASH.as_bytes()].concat(),
+                &[
+                    &CACHE_SCHEMA_VERSION.to_le_bytes()[..],
+                    victory_shader::SOURCE_HASH.as_bytes(),
+                    &victory_shader::emit::view_heap_limit().to_le_bytes(),
+                ]
+                .concat(),
                 victory_shader::emit::loop_limit(),
                 victory_shader::emit::group_sync(),
                 &[
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_LDS_RACE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
