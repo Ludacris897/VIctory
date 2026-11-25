@@ -279,6 +279,7 @@ pub(crate) fn bound_ahead(
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, 1).then_some(dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
