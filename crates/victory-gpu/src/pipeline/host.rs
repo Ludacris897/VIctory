@@ -351,6 +351,20 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+impl HostPipeline {
+    /// How many host groups run one console group along y (`HostShader::split_y`):
+    /// dispatches of this pipeline ask that many times the title's groups in y.
+    pub(crate) fn split_y(&self) -> u32 {
+        self.stages
+            .iter()
+            .filter_map(|s| s.shader.translated())
+            .map(|t| t.host.split_y)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());

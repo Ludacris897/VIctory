@@ -295,6 +295,10 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// A compute program's console group as this many host groups of one console wave,
+    /// stacked along y: the host dispatches this many times the console's groups in y
+    /// (`split_waves`). 1 otherwise.
+    pub split_y: u32,
 }
 
 impl HostShader {
@@ -631,6 +635,20 @@ fn widen(
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
+            // Waves that never meet (no LDS, no barrier) run as groups of their own.
+            if let Some(k) = split_waves(native, p) {
+                let mut one = native.clone();
+                if let crate::native::StageIo::Cs(c1) = &mut one.io {
+                    c1.threads = [cs.threads[0], 64 / cs.threads[0], 1];
+                }
+                if why {
+                    eprintln!("WAVE64-WIDE groups of {:?} split into {k} along y", cs.threads);
+                }
+                return lower::with_split(k, || widen(c, &one, p, why)).map(|(mut h, w)| {
+                    h.split_y = k;
+                    (h, w)
+                });
+            }
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
             }
@@ -670,6 +688,34 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// How many console waves a compute group of `native` holds, where they can run as host groups
+/// of one console wave each, stacked along y ([`HostShader::split_y`]): the program shares no
+/// LDS and waits at no barrier (so its waves never meet, and no wave can tell the others ran
+/// in other groups), its group is one z slice whose console waves are whole rows (a console
+/// wave holds the threads 64w..64w+63 in x-fastest order), and it has more than one wave.
+fn split_waves(native: &NativeProgram, p: &ir::Program) -> Option<u32> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return None;
+    };
+    let [x, y, z] = cs.threads;
+    if !native.wave64 || z != 1 || x == 0 || 64 % x != 0 || cs.lds_bytes() != 0 {
+        return None;
+    }
+    let rows = 64 / x;
+    if y <= rows || y % rows != 0 {
+        return None;
+    }
+    let meets = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let n = i.name();
+        n.starts_with("ds_")
+            || n.starts_with("s_barrier")
+            || n.contains("gds")
+            || n.starts_with("s_sendmsg")
+            || n.starts_with("s_ttrace")
+    });
+    (!meets).then_some(y / rows)
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -771,6 +817,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        split_y: 1,
     };
     Ok((shader, wave_size))
 }
@@ -1184,6 +1231,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            split_y: 1,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1196,6 +1244,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                split_y: 1,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1485,6 +1534,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                split_y: 1,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

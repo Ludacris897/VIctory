@@ -246,6 +246,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.split_y);
     out
 }
 
@@ -314,6 +315,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    // (entries written before it have none: one host group per console group)
+    let split_y = if r.0.is_empty() { 1 } else { r.word()?.max(1) };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -324,6 +327,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        split_y,
     })
 }
 
@@ -358,6 +362,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            split_y: 2,
         }
     }
 
