@@ -119,6 +119,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        // A console group run as several host groups along y (bits 8 up of has_count).
+        uint split = max(has_count >> 8, 1u);
+        g.y = min(g.y * split, 65535u);
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -340,10 +343,11 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    split_y: u32,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, (false, split_y)).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -363,7 +367,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, (true, 1)).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -378,14 +382,30 @@ fn clamp_into(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-    ahead: bool,
+    (ahead, split_y): (bool, u32),
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded =
+        record_clamp_split(c, &list.list, (dst, before), budget, src, count, spec, ahead, split_y);
     if recorded {
         list.indirect_readable(dst);
     }
     recorded
+}
+
+/// [`record_clamp_split`] with one host group per console group.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    at: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_split(c, l, at, budget, src, count, spec, ahead, 1)
 }
 
 /// Records the clamp into `dst`, which is in state `before` (common, or
@@ -394,7 +414,7 @@ fn clamp_into(
 /// their draws ([`bound_ahead`]). False, with nothing recorded, if the
 /// layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
-fn record_clamp_as(
+fn record_clamp_split(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
@@ -403,6 +423,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    split_y: u32,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -447,7 +468,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | (split_y.clamp(1, 0xFF_FFFF) << 8), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -1579,13 +1600,13 @@ void main() {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`, which stays readable
         // as arguments between them.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), 1).unwrap();
         assert_eq!(
             list.indirect_state(&b1),
             args,
             "a clamp leaves the scratch readable as arguments"
         );
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), 1).unwrap();
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -1601,7 +1622,7 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a new scratch buffer is common"
         );
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), 1).unwrap();
         assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
@@ -1631,7 +1652,7 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), 1).unwrap();
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -1773,8 +1794,8 @@ void main() {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), 1).unwrap();
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), 1).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
@@ -1795,7 +1816,7 @@ void main() {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), 1).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
