@@ -7148,8 +7148,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
-    // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // through the kernel if that is off or met a page that was not there
+    // (in slices on several threads with `VICTORY_SPLIT_COPY`).
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read_split(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -7224,6 +7225,63 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
             });
         }
     });
+}
+
+/// How many threads read one big copy of title memory (`VICTORY_SPLIT_COPY`,
+/// 1 to 16; unset or 1: one, as before). A frame's copies are some 250 MB
+/// read by one thread through the kernel at about 3.4 GB/s (74 ms a frame
+/// on an RTX 3090 machine); the memory moves several times faster with more
+/// readers. The kernel's read is safe from several threads, and the slices
+/// do not overlap.
+fn split_copy() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SPLIT_COPY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 16)
+    })
+}
+
+/// Below this a copy is read by one thread (`VICTORY_SPLIT_COPY_MIN_KB`,
+/// 1024 by default): a thread costs tens of microseconds to start.
+fn split_copy_min() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SPLIT_COPY_MIN_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            .max(64)
+            << 10
+    })
+}
+
+/// [`read`] in slices on several threads ([`split_copy`]): true only if every
+/// slice was read whole. On false the caller reads the range again piece by
+/// piece, as after a failed single read, so the result is the same either way.
+fn read_split(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let n = split_copy();
+    if n <= 1 || len < split_copy_min() {
+        return read(src, dst, len);
+    }
+    // Slices of whole 64 KiB blocks, at most `n` of them.
+    let block = 64usize << 10;
+    let slice = len.div_ceil(n).div_ceil(block) * block;
+    let (src, dst) = (src as usize, dst as usize);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (slice..len)
+            .step_by(slice)
+            .map(|at| {
+                let k = slice.min(len - at);
+                s.spawn(move || read((src + at) as *const u8, (dst + at) as *mut u8, k))
+            })
+            .collect();
+        // The first slice on this thread.
+        let first = read(src as *const u8, dst as *mut u8, slice.min(len));
+        parts.into_iter().fold(first, |all, p| p.join().unwrap_or(false) && all)
+    })
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
