@@ -1683,6 +1683,9 @@ pub(crate) fn let_go_idle() {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
         // A window may be stored under multiple keys in `LOOSE`, so its
         // map-only refcount equals the number of keys pointing to it.
         let mut counts: std::collections::HashMap<usize, usize> =

@@ -63,6 +63,13 @@ fn build() -> &'static [u8; 32] {
         } else {
             Ok([&CACHE_SCHEMA_VERSION.to_le_bytes()[..], victory_shader::SOURCE_HASH.as_bytes()].concat())
         };
+        // So is the view heap's null slot (it differs by host GPU): a
+        // translation cached without the clamp must not be served.
+        crate::descriptor::host::probe_view_limit();
+        let translator = translator.map(|mut t| {
+            t.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+            t
+        });
         match translator {
             Ok(translator) => {
                 let switches = [
